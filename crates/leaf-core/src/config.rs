@@ -3,8 +3,12 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Top-level application configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Top-level file-backed application configuration.
+///
+/// The current GUI runtime persists user-editable browser/network settings in the
+/// local imagebox database. This type remains the reusable file-backed config
+/// model for non-interactive/default-driven consumers.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub general: GeneralConfig,
@@ -122,17 +126,6 @@ impl AppConfig {
             .storage_path
             .clone()
             .unwrap_or_else(|| data_dir().join("storage"))
-    }
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            general: GeneralConfig::default(),
-            database: DatabaseConfig::default(),
-            display: DisplayConfig::default(),
-            nodes: Vec::new(),
-        }
     }
 }
 

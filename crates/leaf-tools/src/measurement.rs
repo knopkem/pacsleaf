@@ -57,8 +57,12 @@ pub struct MeasurementResult {
 /// The computed value from a measurement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MeasurementValue {
-    Distance { mm: f64 },
-    Angle { degrees: f64 },
+    Distance {
+        mm: f64,
+    },
+    Angle {
+        degrees: f64,
+    },
     RoiStats {
         mean: f64,
         std_dev: f64,
@@ -67,7 +71,10 @@ pub enum MeasurementValue {
         area_mm2: f64,
         pixel_count: u64,
     },
-    PixelValue { value: f64, unit: String },
+    PixelValue {
+        value: f64,
+        unit: String,
+    },
 }
 
 impl Measurement {

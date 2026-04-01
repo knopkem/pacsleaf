@@ -29,10 +29,7 @@ pub enum AppEvent {
     RetrievalCompleted { study_uid: StudyUid },
 
     /// Retrieval failed.
-    RetrievalFailed {
-        study_uid: StudyUid,
-        reason: String,
-    },
+    RetrievalFailed { study_uid: StudyUid, reason: String },
 
     /// User requested to open a study in the viewer.
     OpenStudy { study_uid: StudyUid },

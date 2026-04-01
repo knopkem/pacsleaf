@@ -13,6 +13,9 @@ const PIXEL_SPACING: Tag = Tag::new(0x0028, 0x0030);
 const IMAGE_POSITION_PATIENT: Tag = Tag::new(0x0020, 0x0032);
 const IMAGE_ORIENTATION_PATIENT: Tag = Tag::new(0x0020, 0x0037);
 
+/// Geometry extracted from a DICOM instance for stack ordering.
+pub type InstanceGeometry = (Option<[f64; 3]>, Option<[f64; 6]>);
+
 /// Extract study-level information from a DICOM dataset.
 pub fn extract_study_info(ds: &DataSet) -> LeafResult<StudyInfo> {
     let study_uid = ds
@@ -32,13 +35,15 @@ pub fn extract_study_info(ds: &DataSet) -> LeafResult<StudyInfo> {
     Ok(StudyInfo {
         study_uid: StudyUid(study_uid),
         patient,
-        study_date: ds
-            .get_string(tags::STUDY_DATE)
-            .and_then(parse_dicom_date),
+        study_date: ds.get_string(tags::STUDY_DATE).and_then(parse_dicom_date),
         study_time: ds.get_string(tags::STUDY_TIME).map(|s| s.to_string()),
-        study_description: ds.get_string(tags::STUDY_DESCRIPTION).map(|s| s.to_string()),
+        study_description: ds
+            .get_string(tags::STUDY_DESCRIPTION)
+            .map(|s| s.to_string()),
         accession_number: ds.get_string(tags::ACCESSION_NUMBER).map(|s| s.to_string()),
-        referring_physician: ds.get_string(tags::REFERRING_PHYSICIAN_NAME).map(|s| s.to_string()),
+        referring_physician: ds
+            .get_string(tags::REFERRING_PHYSICIAN_NAME)
+            .map(|s| s.to_string()),
         modalities: ds
             .get_string(tags::MODALITY)
             .map(|m| vec![m.to_string()])
@@ -63,7 +68,9 @@ pub fn extract_series_info(ds: &DataSet) -> LeafResult<SeriesInfo> {
         series_uid: SeriesUid(series_uid),
         study_uid: StudyUid(study_uid),
         series_number: ds.get_i32(tags::SERIES_NUMBER),
-        series_description: ds.get_string(tags::SERIES_DESCRIPTION).map(|s| s.to_string()),
+        series_description: ds
+            .get_string(tags::SERIES_DESCRIPTION)
+            .map(|s| s.to_string()),
         modality: ds.get_string(tags::MODALITY).unwrap_or("").to_string(),
         body_part: ds.get_string(BODY_PART_EXAMINED).map(|s| s.to_string()),
         num_instances: 0,
@@ -103,9 +110,7 @@ pub fn extract_instance_info(ds: &DataSet, file_path: Option<String>) -> LeafRes
 }
 
 /// Open a DICOM Part 10 file and extract all metadata levels.
-pub fn import_dicom_file(
-    path: &Path,
-) -> LeafResult<(StudyInfo, SeriesInfo, InstanceInfo)> {
+pub fn import_dicom_file(path: &Path) -> LeafResult<(StudyInfo, SeriesInfo, InstanceInfo)> {
     let file = FileFormat::open(path).map_err(|e| LeafError::DicomParse(e.to_string()))?;
     let ds = &file.dataset;
 
@@ -116,7 +121,7 @@ pub fn import_dicom_file(
     Ok((study, series, instance))
 }
 
-pub fn read_instance_geometry(path: &Path) -> LeafResult<(Option<[f64; 3]>, Option<[f64; 6]>)> {
+pub fn read_instance_geometry(path: &Path) -> LeafResult<InstanceGeometry> {
     let file = FileFormat::open(path).map_err(|e| LeafError::DicomParse(e.to_string()))?;
     let ds = &file.dataset;
     Ok((

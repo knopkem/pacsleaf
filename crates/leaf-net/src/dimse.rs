@@ -1,8 +1,7 @@
 //! DIMSE SCU client for traditional PACS communication.
 
 use dicom_toolkit_net::{
-    Association, AssociationConfig, FindRequest, PresentationContextRq,
-    c_echo, c_find,
+    c_echo, c_find, Association, AssociationConfig, FindRequest, PresentationContextRq,
 };
 use leaf_core::config::PacsNodeConfig;
 use leaf_core::error::{LeafError, LeafResult};

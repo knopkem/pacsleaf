@@ -20,12 +20,10 @@ impl DicomWebClient {
             .clone()
             .ok_or_else(|| LeafError::Config("DICOMweb URL not configured".into()))?;
 
-        let client = Client::builder()
-            .build()
-            .map_err(|e| LeafError::DicomWeb {
-                status: 0,
-                message: e.to_string(),
-            })?;
+        let client = Client::builder().build().map_err(|e| LeafError::DicomWeb {
+            status: 0,
+            message: e.to_string(),
+        })?;
 
         Ok(Self {
             client,
@@ -35,11 +33,10 @@ impl DicomWebClient {
     }
 
     /// QIDO-RS: Search for studies.
-    pub async fn search_studies(
-        &self,
-        params: &[(&str, &str)],
-    ) -> LeafResult<Vec<Value>> {
-        let studies = self.get_json(&format!("{}/studies", self.base_url), params).await?;
+    pub async fn search_studies(&self, params: &[(&str, &str)]) -> LeafResult<Vec<Value>> {
+        let studies = self
+            .get_json(&format!("{}/studies", self.base_url), params)
+            .await?;
 
         debug!("QIDO-RS returned {} studies", studies.len());
         Ok(studies)
@@ -51,8 +48,11 @@ impl DicomWebClient {
         study_uid: &str,
         params: &[(&str, &str)],
     ) -> LeafResult<Vec<Value>> {
-        self.get_json(&format!("{}/studies/{study_uid}/series", self.base_url), params)
-            .await
+        self.get_json(
+            &format!("{}/studies/{study_uid}/series", self.base_url),
+            params,
+        )
+        .await
     }
 
     /// QIDO-RS: Search for instances within a series.
@@ -63,7 +63,10 @@ impl DicomWebClient {
         params: &[(&str, &str)],
     ) -> LeafResult<Vec<Value>> {
         self.get_json(
-            &format!("{}/studies/{study_uid}/series/{series_uid}/instances", self.base_url),
+            &format!(
+                "{}/studies/{study_uid}/series/{series_uid}/instances",
+                self.base_url
+            ),
             params,
         )
         .await
@@ -86,13 +89,10 @@ impl DicomWebClient {
             request = request.bearer_auth(token);
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| LeafError::DicomWeb {
-                status: 0,
-                message: e.to_string(),
-            })?;
+        let response = request.send().await.map_err(|e| LeafError::DicomWeb {
+            status: 0,
+            message: e.to_string(),
+        })?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -103,13 +103,10 @@ impl DicomWebClient {
             });
         }
 
-        let metadata: Vec<Value> = response
-            .json()
-            .await
-            .map_err(|e| LeafError::DicomWeb {
-                status: 0,
-                message: e.to_string(),
-            })?;
+        let metadata: Vec<Value> = response.json().await.map_err(|e| LeafError::DicomWeb {
+            status: 0,
+            message: e.to_string(),
+        })?;
 
         Ok(metadata)
     }
@@ -132,13 +129,10 @@ impl DicomWebClient {
             request = request.bearer_auth(token);
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| LeafError::DicomWeb {
-                status: 0,
-                message: e.to_string(),
-            })?;
+        let response = request.send().await.map_err(|e| LeafError::DicomWeb {
+            status: 0,
+            message: e.to_string(),
+        })?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -149,13 +143,10 @@ impl DicomWebClient {
             });
         }
 
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| LeafError::DicomWeb {
-                status: 0,
-                message: e.to_string(),
-            })?;
+        let bytes = response.bytes().await.map_err(|e| LeafError::DicomWeb {
+            status: 0,
+            message: e.to_string(),
+        })?;
 
         Ok(bytes.to_vec())
     }
@@ -171,18 +162,18 @@ impl DicomWebClient {
             request = request.query(&[(key, value)]);
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| LeafError::DicomWeb {
-                status: 0,
-                message: e.to_string(),
-            })?;
+        let response = request.send().await.map_err(|e| LeafError::DicomWeb {
+            status: 0,
+            message: e.to_string(),
+        })?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(LeafError::DicomWeb { status, message: body });
+            return Err(LeafError::DicomWeb {
+                status,
+                message: body,
+            });
         }
 
         response.json().await.map_err(|e| LeafError::DicomWeb {

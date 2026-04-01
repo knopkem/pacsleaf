@@ -65,8 +65,10 @@ impl Imagebox {
             let mut series_table = txn.open_table(SERIES).map_err(db_err)?;
             let mut study_series_idx = txn.open_table(STUDY_SERIES_INDEX).map_err(db_err)?;
 
-            let series_uids: Vec<&str> =
-                series_list.iter().map(|s| s.series_uid.0.as_str()).collect();
+            let series_uids: Vec<&str> = series_list
+                .iter()
+                .map(|s| s.series_uid.0.as_str())
+                .collect();
             let idx_json = serde_json::to_string(&series_uids).map_err(db_err)?;
             study_series_idx
                 .insert(study.study_uid.0.as_str(), idx_json.as_str())
@@ -116,9 +118,7 @@ impl Imagebox {
                 uids.push(study.study_uid.0.clone());
             }
             let idx_json = serde_json::to_string(&uids).map_err(db_err)?;
-            patient_idx
-                .insert(pid, idx_json.as_str())
-                .map_err(db_err)?;
+            patient_idx.insert(pid, idx_json.as_str()).map_err(db_err)?;
         }
 
         txn.commit().map_err(db_err)?;
@@ -165,10 +165,7 @@ impl Imagebox {
         let idx_table = txn.open_table(STUDY_SERIES_INDEX).map_err(db_err)?;
         let series_table = txn.open_table(SERIES).map_err(db_err)?;
 
-        let series_uids: Vec<String> = match idx_table
-            .get(study_uid.0.as_str())
-            .map_err(db_err)?
-        {
+        let series_uids: Vec<String> = match idx_table.get(study_uid.0.as_str()).map_err(db_err)? {
             Some(val) => serde_json::from_str(val.value()).unwrap_or_default(),
             None => return Ok(Vec::new()),
         };
@@ -193,10 +190,7 @@ impl Imagebox {
         let idx_table = txn.open_table(SERIES_INSTANCE_INDEX).map_err(db_err)?;
         let inst_table = txn.open_table(INSTANCES).map_err(db_err)?;
 
-        let inst_uids: Vec<String> = match idx_table
-            .get(series_uid.0.as_str())
-            .map_err(db_err)?
-        {
+        let inst_uids: Vec<String> = match idx_table.get(series_uid.0.as_str()).map_err(db_err)? {
             Some(val) => serde_json::from_str(val.value()).unwrap_or_default(),
             None => return Ok(Vec::new()),
         };
@@ -227,8 +221,7 @@ impl Imagebox {
                     .get(s.series_uid.0.as_str())
                     .map_err(db_err)?
                 {
-                    let uids: Vec<String> =
-                        serde_json::from_str(val.value()).unwrap_or_default();
+                    let uids: Vec<String> = serde_json::from_str(val.value()).unwrap_or_default();
                     instance_uids_to_delete.extend(uids);
                 }
             }

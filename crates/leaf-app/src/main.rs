@@ -10,19 +10,19 @@ use image::load_from_memory;
 use leaf_core::config::{data_dir, PacsNodeConfig, PacsProtocol};
 use leaf_core::domain::{InstanceInfo, SeriesInfo, StudyInfo, StudyUid};
 use leaf_core::error::{LeafError, LeafResult};
+use leaf_db::imagebox::Imagebox;
 use leaf_dicom::metadata::{import_dicom_file, read_instance_geometry};
 use leaf_dicom::pixel::{decode_frame_with_window, frame_count};
-use leaf_db::imagebox::Imagebox;
 use leaf_net::dicomweb::DicomWebClient;
 use leaf_tools::measurement::{Measurement, MeasurementKind, MeasurementValue};
 use rfd::FileDialog;
+use serde::{Deserialize, Serialize};
+use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use serde::{Deserialize, Serialize};
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -96,6 +96,29 @@ struct RemoteSeriesRef {
     instance_count: i32,
 }
 
+#[derive(Clone, Copy, Default)]
+struct BrowserQuery<'a> {
+    patient_name: &'a str,
+    patient_id: &'a str,
+    accession: &'a str,
+}
+
+struct NormalizedBrowserQuery {
+    patient_name: String,
+    patient_id: String,
+    accession: String,
+}
+
+impl BrowserQuery<'_> {
+    fn normalized(self) -> NormalizedBrowserQuery {
+        NormalizedBrowserQuery {
+            patient_name: normalize_query(self.patient_name),
+            patient_id: normalize_query(self.patient_id),
+            accession: normalize_query(self.accession),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BrowserSettings {
     #[serde(default)]
@@ -127,7 +150,8 @@ impl BrowserSettings {
     }
 
     fn pacs_nodes(&self) -> Vec<PacsNodeConfig> {
-        let dimse_ready = !self.dimse_host.trim().is_empty() && !self.remote_ae_title.trim().is_empty();
+        let dimse_ready =
+            !self.dimse_host.trim().is_empty() && !self.remote_ae_title.trim().is_empty();
         let dicomweb_url = self.dicomweb_url.trim();
         let dicomweb_ready = !dicomweb_url.is_empty();
 
@@ -181,8 +205,7 @@ fn main() -> Result<()> {
     // Initialize logging.
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -200,7 +223,11 @@ fn main() -> Result<()> {
 
     for import_path in cli_import_paths() {
         let summary = import_from_path(&imagebox, &import_path)?;
-        info!("Imported {} studies from {}", summary.study_count, import_path.display());
+        info!(
+            "Imported {} studies from {}",
+            summary.study_count,
+            import_path.display()
+        );
     }
 
     // Create the event bus.
@@ -216,12 +243,11 @@ fn main() -> Result<()> {
         &settings_state.borrow().pacs_nodes(),
         browser.get_network_mode(),
         &runtime,
-        "",
-        "",
-        "",
+        BrowserQuery::default(),
     )?;
 
-    let open_windows: Rc<RefCell<Vec<leaf_ui::StudyViewerWindow>>> = Rc::new(RefCell::new(Vec::new()));
+    let open_windows: Rc<RefCell<Vec<leaf_ui::StudyViewerWindow>>> =
+        Rc::new(RefCell::new(Vec::new()));
 
     // Wire up callbacks.
     let browser_weak = browser.as_weak();
@@ -230,19 +256,18 @@ fn main() -> Result<()> {
     let runtime_for_search = runtime.clone();
     browser.on_search(move |name, id, accession| {
         let browser = browser_weak.upgrade().unwrap();
-        info!(
-            "Search: name={}, id={}, accession={}",
-            name, id, accession
-        );
+        info!("Search: name={}, id={}, accession={}", name, id, accession);
         if let Err(error) = refresh_browser(
             &browser,
             &imagebox_for_search,
             &settings_for_search.borrow().pacs_nodes(),
             browser.get_network_mode(),
             &runtime_for_search,
-            name.as_str(),
-            id.as_str(),
-            accession.as_str(),
+            BrowserQuery {
+                patient_name: name.as_str(),
+                patient_id: id.as_str(),
+                accession: accession.as_str(),
+            },
         ) {
             browser.set_connection_status(format!("Search failed: {error}").into());
         }
@@ -301,8 +326,7 @@ fn main() -> Result<()> {
             save_browser_settings(&imagebox_for_import, &new_settings)?;
             *settings_for_import.borrow_mut() = new_settings.clone();
 
-            import_from_path(&imagebox_for_import, import_path.as_ref())
-            .and_then(|summary| {
+            import_from_path(&imagebox_for_import, import_path.as_ref()).and_then(|summary| {
                 if let Some(browser) = browser_for_import.upgrade() {
                     let nodes = new_settings.pacs_nodes();
                     refresh_browser(
@@ -311,15 +335,10 @@ fn main() -> Result<()> {
                         &nodes,
                         browser.get_network_mode(),
                         &runtime_for_import,
-                        "",
-                        "",
-                        "",
+                        BrowserQuery::default(),
                     )?;
                     let status = if summary.file_count == 0 {
-                        format!(
-                            "No DICOM files found in {}",
-                            import_path.display()
-                        )
+                        format!("No DICOM files found in {}", import_path.display())
                     } else {
                         format!(
                             "Imported {} files from {} into {} studies",
@@ -354,9 +373,7 @@ fn main() -> Result<()> {
                 &settings_for_local.borrow().pacs_nodes(),
                 false,
                 &runtime_for_local,
-                "",
-                "",
-                "",
+                BrowserQuery::default(),
             );
             browser.set_connection_status("Local imagebox".into());
         }
@@ -375,9 +392,7 @@ fn main() -> Result<()> {
                 &settings_for_network.borrow().pacs_nodes(),
                 true,
                 &runtime_for_network,
-                "",
-                "",
-                "",
+                BrowserQuery::default(),
             );
             if let Err(error) = result {
                 browser.set_connection_status(format!("Network enable failed: {error}").into());
@@ -441,9 +456,7 @@ fn main() -> Result<()> {
                         &nodes,
                         browser.get_network_mode(),
                         &runtime_for_save,
-                        "",
-                        "",
-                        "",
+                        BrowserQuery::default(),
                     )?;
                     browser.set_connection_status("Settings saved".into());
                 }
@@ -471,13 +484,9 @@ fn refresh_browser(
     nodes: &[PacsNodeConfig],
     include_remote: bool,
     runtime: &tokio::runtime::Runtime,
-    patient_name: &str,
-    patient_id: &str,
-    accession: &str,
+    query: BrowserQuery<'_>,
 ) -> LeafResult<()> {
-    let patient_name = normalize_query(patient_name);
-    let patient_id = normalize_query(patient_id);
-    let accession = normalize_query(accession);
+    let query = query.normalized();
 
     let mut studies = imagebox.list_studies()?;
     studies.sort_by(|a, b| {
@@ -488,10 +497,22 @@ fn refresh_browser(
 
     let mut entries = studies
         .into_iter()
-        .filter(|study| matches_study(study, &patient_name, &patient_id, &accession))
+        .filter(|study| {
+            matches_study(
+                study,
+                &query.patient_name,
+                &query.patient_id,
+                &query.accession,
+            )
+        })
         .map(|study| {
-            let series = imagebox.get_series_for_study(&study.study_uid).unwrap_or_default();
-            let instance_count = series.iter().map(|series| series.num_instances as i32).sum();
+            let series = imagebox
+                .get_series_for_study(&study.study_uid)
+                .unwrap_or_default();
+            let instance_count = series
+                .iter()
+                .map(|series| series.num_instances as i32)
+                .sum();
             leaf_ui::StudyEntry {
                 study_uid: study.study_uid.0.into(),
                 patient_name: empty_fallback(&study.patient.patient_name).into(),
@@ -507,7 +528,11 @@ fn refresh_browser(
                     .cloned()
                     .unwrap_or_else(|| "-".to_string())
                     .into(),
-                description: study.study_description.clone().unwrap_or_else(|| "-".to_string()).into(),
+                description: study
+                    .study_description
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string())
+                    .into(),
                 series_count: series.len() as i32,
                 instance_count,
                 source: SharedString::from("Local"),
@@ -516,13 +541,7 @@ fn refresh_browser(
         .collect::<Vec<_>>();
 
     if include_remote {
-        entries.extend(search_remote_studies(
-            runtime,
-            nodes,
-            &patient_name,
-            &patient_id,
-            &accession,
-        )?);
+        entries.extend(search_remote_studies(runtime, nodes, &query)?);
     }
 
     let model = Rc::new(VecModel::from(entries));
@@ -534,11 +553,9 @@ fn refresh_browser(
 fn search_remote_studies(
     runtime: &tokio::runtime::Runtime,
     nodes: &[PacsNodeConfig],
-    patient_name: &str,
-    patient_id: &str,
-    accession: &str,
+    query: &NormalizedBrowserQuery,
 ) -> LeafResult<Vec<leaf_ui::StudyEntry>> {
-    if patient_name.is_empty() && patient_id.is_empty() && accession.is_empty() {
+    if query.patient_name.is_empty() && query.patient_id.is_empty() && query.accession.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -551,14 +568,14 @@ fn search_remote_studies(
 
             let client = DicomWebClient::new(node)?;
             let mut params = Vec::new();
-            if !patient_name.is_empty() {
-                params.push(("PatientName", patient_name));
+            if !query.patient_name.is_empty() {
+                params.push(("PatientName", query.patient_name.as_str()));
             }
-            if !patient_id.is_empty() {
-                params.push(("PatientID", patient_id));
+            if !query.patient_id.is_empty() {
+                params.push(("PatientID", query.patient_id.as_str()));
             }
-            if !accession.is_empty() {
-                params.push(("AccessionNumber", accession));
+            if !query.accession.is_empty() {
+                params.push(("AccessionNumber", query.accession.as_str()));
             }
 
             let studies = client.search_studies(&params).await?;
@@ -566,14 +583,20 @@ fn search_remote_studies(
                 let study_uid = qido_first_string(&study, "0020000D").unwrap_or_default();
                 entries.push(leaf_ui::StudyEntry {
                     study_uid: format!("remote:{}:{}", node.name, study_uid).into(),
-                    patient_name: qido_first_string(&study, "00100010").unwrap_or_else(|| "-".to_string()).into(),
-                    patient_id: qido_first_string(&study, "00100020").unwrap_or_else(|| "-".to_string()).into(),
+                    patient_name: qido_first_string(&study, "00100010")
+                        .unwrap_or_else(|| "-".to_string())
+                        .into(),
+                    patient_id: qido_first_string(&study, "00100020")
+                        .unwrap_or_else(|| "-".to_string())
+                        .into(),
                     study_date: format_qido_date(qido_first_string(&study, "00080020")).into(),
                     modality: qido_first_string(&study, "00080061")
                         .or_else(|| qido_first_string(&study, "00080060"))
                         .unwrap_or_else(|| "-".to_string())
                         .into(),
-                    description: qido_first_string(&study, "00081030").unwrap_or_else(|| "-".to_string()).into(),
+                    description: qido_first_string(&study, "00081030")
+                        .unwrap_or_else(|| "-".to_string())
+                        .into(),
                     series_count: qido_first_int(&study, "00201206"),
                     instance_count: qido_first_int(&study, "00201208"),
                     source: format!("Remote: {}", node.name).into(),
@@ -628,7 +651,9 @@ fn connection_status_text(nodes: &[PacsNodeConfig], include_remote: bool) -> Str
         .count();
     let dimse_count = nodes
         .iter()
-        .filter(|node| !node.host.trim().is_empty() && !node.ae_title.trim().is_empty() && node.port != 0)
+        .filter(|node| {
+            !node.host.trim().is_empty() && !node.ae_title.trim().is_empty() && node.port != 0
+        })
         .count();
 
     match (dicomweb_count, dimse_count) {
@@ -649,7 +674,8 @@ fn parse_remote_study_ref(value: &str) -> Option<RemoteStudyRef> {
 }
 
 fn find_node<'a>(nodes: &'a [PacsNodeConfig], name: &str) -> LeafResult<&'a PacsNodeConfig> {
-    nodes.iter()
+    nodes
+        .iter()
         .find(|node| node.name == name)
         .ok_or_else(|| LeafError::Config(format!("Unknown PACS node: {name}")))
 }
@@ -680,7 +706,11 @@ fn import_from_path(imagebox: &Imagebox, path: &Path) -> LeafResult<ImportSummar
                 imported_files += 1;
             }
             Err(error) => {
-                info!("Skipping non-DICOM or unreadable file {}: {}", file.display(), error);
+                info!(
+                    "Skipping non-DICOM or unreadable file {}: {}",
+                    file.display(),
+                    error
+                );
             }
         }
     }
@@ -742,10 +772,14 @@ fn merge_import_item(
         .studies
         .entry(study.study_uid.0.clone())
         .and_modify(|existing| {
-            if existing.patient.patient_name.trim().is_empty() && !study.patient.patient_name.trim().is_empty() {
+            if existing.patient.patient_name.trim().is_empty()
+                && !study.patient.patient_name.trim().is_empty()
+            {
                 existing.patient.patient_name = study.patient.patient_name.clone();
             }
-            if existing.patient.patient_id.trim().is_empty() && !study.patient.patient_id.trim().is_empty() {
+            if existing.patient.patient_id.trim().is_empty()
+                && !study.patient.patient_id.trim().is_empty()
+            {
                 existing.patient.patient_id = study.patient.patient_id.clone();
             }
             if existing.study_description.is_none() {
@@ -844,14 +878,14 @@ fn open_remote_viewer_for_study(
     let (series_list, patient_name, study_description) =
         runtime.block_on(load_remote_series_and_metadata(&client, &remote.study_uid))?;
 
-    let viewer = leaf_ui::StudyViewerWindow::new()
-        .map_err(|error| LeafError::Render(error.to_string()))?;
+    let viewer =
+        leaf_ui::StudyViewerWindow::new().map_err(|error| LeafError::Render(error.to_string()))?;
     viewer.set_patient_name(patient_name.into());
     viewer.set_study_description(study_description.into());
     viewer.set_measurement_panel_visible(false);
-    viewer.set_measurements(ModelRc::from(Rc::new(VecModel::from(
-        Vec::<leaf_ui::MeasurementEntry>::new(),
-    ))));
+    viewer.set_measurements(ModelRc::from(Rc::new(VecModel::from(Vec::<
+        leaf_ui::MeasurementEntry,
+    >::new()))));
     install_viewer_tool_state(&viewer);
 
     let active_series_uid = series_list
@@ -913,7 +947,9 @@ async fn load_remote_series_and_metadata(
         .filter(|item| !item.series_uid.is_empty())
         .collect::<Vec<_>>();
 
-    let study_rows = client.search_studies(&[("StudyInstanceUID", study_uid)]).await?;
+    let study_rows = client
+        .search_studies(&[("StudyInstanceUID", study_uid)])
+        .await?;
     let first_study = study_rows.first();
     let patient_name = first_study
         .and_then(|study| qido_first_string(study, "00100010"))
@@ -957,10 +993,13 @@ fn update_remote_viewer_image(
             .first()
             .and_then(|item| qido_first_string(item, "00080018"))
             .ok_or_else(|| LeafError::NoData("Remote series has no instances".into()))?;
-        client.get_rendered_frame(study_uid, series_uid, &instance_uid, 1).await
+        client
+            .get_rendered_frame(study_uid, series_uid, &instance_uid, 1)
+            .await
     })?;
 
-    let decoded = load_from_memory(&encoded).map_err(|error| LeafError::Render(error.to_string()))?;
+    let decoded =
+        load_from_memory(&encoded).map_err(|error| LeafError::Render(error.to_string()))?;
     let rgba = decoded.into_rgba8();
     viewer.set_viewport_image(
         leaf_ui::image_from_rgba8(rgba.width(), rgba.height(), rgba.into_raw())
@@ -972,7 +1011,10 @@ fn update_remote_viewer_image(
     Ok(())
 }
 
-fn open_viewer_for_study(imagebox: &Imagebox, study_uid: &str) -> LeafResult<leaf_ui::StudyViewerWindow> {
+fn open_viewer_for_study(
+    imagebox: &Imagebox,
+    study_uid: &str,
+) -> LeafResult<leaf_ui::StudyViewerWindow> {
     let study_uid = StudyUid(study_uid.to_string());
     let study = imagebox
         .get_study(&study_uid)?
@@ -993,8 +1035,8 @@ fn open_viewer_for_study(imagebox: &Imagebox, study_uid: &str) -> LeafResult<lea
     let frames_by_series = build_frames_by_series(&instances_by_series);
     let measurements_by_series = HashMap::new();
 
-    let viewer = leaf_ui::StudyViewerWindow::new()
-        .map_err(|error| LeafError::Render(error.to_string()))?;
+    let viewer =
+        leaf_ui::StudyViewerWindow::new().map_err(|error| LeafError::Render(error.to_string()))?;
     viewer.set_patient_name(study.patient.patient_name.clone().into());
     viewer.set_connection_status("Local imagebox".into());
     viewer.set_active_tool(leaf_ui::ViewerTool::WindowLevel);
@@ -1105,7 +1147,9 @@ fn open_viewer_for_study(imagebox: &Imagebox, study_uid: &str) -> LeafResult<lea
         let mut session = session_for_mouse_down.borrow_mut();
         update_viewport_dimensions(&mut session, viewport_width, viewport_height);
         match session.active_tool {
-            leaf_ui::ViewerTool::WindowLevel | leaf_ui::ViewerTool::Pan | leaf_ui::ViewerTool::Zoom => {
+            leaf_ui::ViewerTool::WindowLevel
+            | leaf_ui::ViewerTool::Pan
+            | leaf_ui::ViewerTool::Zoom => {
                 session.drag_state = Some(ViewportDragState {
                     origin_x: x,
                     origin_y: y,
@@ -1118,11 +1162,8 @@ fn open_viewer_for_study(imagebox: &Imagebox, study_uid: &str) -> LeafResult<lea
             }
             leaf_ui::ViewerTool::Line => {
                 session.drag_state = None;
-                session.draft_measurement =
-                    viewport_to_image_point(&session, x, y, false).map(|start| DraftMeasurement {
-                        start,
-                        end: start,
-                    });
+                session.draft_measurement = viewport_to_image_point(&session, x, y, false)
+                    .map(|start| DraftMeasurement { start, end: start });
                 if let Err(error) = update_measurement_overlays(&session) {
                     info!("Failed to begin line measurement: {}", error);
                 }
@@ -1192,7 +1233,8 @@ fn open_viewer_for_study(imagebox: &Imagebox, study_uid: &str) -> LeafResult<lea
             }
             leaf_ui::ViewerTool::WindowLevel => {
                 let sensitivity = (drag_state.start_window_width / 512.0).max(1.0);
-                session.window_center = Some(drag_state.start_window_center + dx as f64 * sensitivity);
+                session.window_center =
+                    Some(drag_state.start_window_center + dx as f64 * sensitivity);
                 session.window_width =
                     Some((drag_state.start_window_width - dy as f64 * sensitivity).max(1.0));
                 update_viewer_image(&mut session)
@@ -1256,7 +1298,8 @@ fn open_viewer_for_study(imagebox: &Imagebox, study_uid: &str) -> LeafResult<lea
         session.active_frame_index = selected.slice_index.min(max_index);
         let value_text = measurement_value_text(&selected, active_pixel_spacing(&session));
 
-        let result = update_viewer_image(&mut session).and_then(|_| update_measurements_model(&session));
+        let result =
+            update_viewer_image(&mut session).and_then(|_| update_measurements_model(&session));
         if let Err(error) = result {
             info!("Failed to select measurement: {}", error);
             return;
@@ -1264,7 +1307,12 @@ fn open_viewer_for_study(imagebox: &Imagebox, study_uid: &str) -> LeafResult<lea
 
         if let Some(viewer) = session.viewer.upgrade() {
             viewer.set_connection_status(
-                format!("Selected {} {}", measurement_kind_label(&selected), value_text).into(),
+                format!(
+                    "Selected {} {}",
+                    measurement_kind_label(&selected),
+                    value_text
+                )
+                .into(),
             );
         }
     });
@@ -1324,7 +1372,11 @@ fn update_measurements_model(session: &ViewerSession) -> LeafResult<()> {
     Ok(())
 }
 
-fn update_viewport_dimensions(session: &mut ViewerSession, viewport_width: f32, viewport_height: f32) {
+fn update_viewport_dimensions(
+    session: &mut ViewerSession,
+    viewport_width: f32,
+    viewport_height: f32,
+) {
     if viewport_width > 0.0 {
         session.viewport_width = viewport_width;
     }
@@ -1456,8 +1508,8 @@ fn measurement_overlay(
     Some(leaf_ui::MeasurementOverlay {
         id: id.into(),
         commands: format!("M {start_x:.2} {start_y:.2} L {end_x:.2} {end_y:.2}").into(),
-        label_x: (end_x + 6.0).into(),
-        label_y: (end_y - 16.0).max(6.0).into(),
+        label_x: end_x + 6.0,
+        label_y: (end_y - 16.0).max(6.0),
         label: label.into(),
         selected,
         draft,
@@ -1521,12 +1573,7 @@ fn image_to_viewport_point(session: &ViewerSession, point: DVec2) -> Option<(f32
     ))
 }
 
-fn viewport_to_image_point(
-    session: &ViewerSession,
-    x: f32,
-    y: f32,
-    clamp: bool,
-) -> Option<DVec2> {
+fn viewport_to_image_point(session: &ViewerSession, x: f32, y: f32, clamp: bool) -> Option<DVec2> {
     let geometry = current_viewport_geometry(session)?;
     let frame_width = session.active_frame_width as f32;
     let frame_height = session.active_frame_height as f32;
@@ -1773,7 +1820,8 @@ fn sort_instances_for_stack(instances: &mut [InstanceInfo]) {
 
 fn hydrate_instance_geometry(instances: &mut [InstanceInfo]) {
     for instance in instances.iter_mut() {
-        if instance.image_position_patient.is_some() && instance.image_orientation_patient.is_some() {
+        if instance.image_position_patient.is_some() && instance.image_orientation_patient.is_some()
+        {
             continue;
         }
 
@@ -1830,104 +1878,15 @@ fn slice_distance(reference_ipp: [f64; 3], image_ipp: [f64; 3], scan_axis_normal
         reference_ipp[2] - image_ipp[2],
     ];
 
-    delta[0] * scan_axis_normal[0]
-        + delta[1] * scan_axis_normal[1]
-        + delta[2] * scan_axis_normal[2]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use leaf_core::domain::{SeriesUid, SopInstanceUid, StudyUid};
-    use leaf_tools::measurement::Measurement;
-
-    fn instance(
-        sop_uid: &str,
-        instance_number: Option<i32>,
-        ipp: Option<[f64; 3]>,
-        iop: Option<[f64; 6]>,
-    ) -> InstanceInfo {
-        InstanceInfo {
-            sop_instance_uid: SopInstanceUid(sop_uid.to_string()),
-            series_uid: SeriesUid("series".to_string()),
-            study_uid: StudyUid("study".to_string()),
-            sop_class_uid: String::new(),
-            instance_number,
-            image_position_patient: ipp,
-            image_orientation_patient: iop,
-            transfer_syntax_uid: String::new(),
-            file_path: None,
-        }
-    }
-
-    #[test]
-    fn sorts_instances_by_patient_position_when_geometry_is_available() {
-        let iop = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
-        let mut instances = vec![
-            instance("3", Some(30), Some([0.0, 0.0, 2.0]), Some(iop)),
-            instance("1", Some(10), Some([0.0, 0.0, 0.0]), Some(iop)),
-            instance("2", Some(20), Some([0.0, 0.0, 1.0]), Some(iop)),
-        ];
-
-        sort_instances_for_stack(&mut instances);
-
-        let ordered_numbers = instances
-            .iter()
-            .map(|instance| instance.instance_number.unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(ordered_numbers, vec![10, 20, 30]);
-    }
-
-    #[test]
-    fn falls_back_to_instance_number_when_geometry_is_missing() {
-        let mut instances = vec![
-            instance("3", Some(30), None, None),
-            instance("1", Some(10), None, None),
-            instance("2", Some(20), None, None),
-        ];
-
-        sort_instances_for_stack(&mut instances);
-
-        let ordered_numbers = instances
-            .iter()
-            .map(|instance| instance.instance_number.unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(ordered_numbers, vec![10, 20, 30]);
-    }
-
-    #[test]
-    fn maps_viewport_points_into_image_space_with_contain_fit() {
-        let geometry =
-            displayed_image_geometry(800.0, 600.0, 512, 256, 1.0, 0.0, 0.0).unwrap();
-        assert!((geometry.image_origin_y - 100.0).abs() < 0.001);
-        assert!((geometry.image_width - 800.0).abs() < 0.001);
-        assert!((geometry.image_height - 400.0).abs() < 0.001);
-
-        let normalized_x = (400.0 - geometry.image_origin_x) / geometry.image_width;
-        let normalized_y = (300.0 - geometry.image_origin_y) / geometry.image_height;
-        let image_point = DVec2::new(normalized_x as f64 * 512.0, normalized_y as f64 * 256.0);
-
-        assert!((image_point.x - 256.0).abs() < 0.001);
-        assert!((image_point.y - 128.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn formats_line_measurement_values_in_millimeters() {
-        let measurement = Measurement::line(
-            "series",
-            0,
-            DVec2::new(0.0, 0.0),
-            DVec2::new(3.0, 4.0),
-        );
-
-        assert_eq!(measurement_value_text(&measurement, (1.0, 1.0)), "5.00 mm");
-    }
+    delta[0] * scan_axis_normal[0] + delta[1] * scan_axis_normal[1] + delta[2] * scan_axis_normal[2]
 }
 
 fn load_browser_settings(imagebox: &Imagebox) -> LeafResult<BrowserSettings> {
     imagebox
         .get_setting("browser_settings")?
-        .map(|value| serde_json::from_str(&value).map_err(|error| LeafError::Database(error.to_string())))
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| LeafError::Database(error.to_string()))
+        })
         .transpose()
         .map(|settings| settings.unwrap_or_default())
 }
@@ -1946,7 +1905,8 @@ fn validate_browser_settings(settings: &BrowserSettings) -> LeafResult<()> {
 }
 
 fn save_browser_settings(imagebox: &Imagebox, settings: &BrowserSettings) -> LeafResult<()> {
-    let value = serde_json::to_string(settings).map_err(|error| LeafError::Database(error.to_string()))?;
+    let value =
+        serde_json::to_string(settings).map_err(|error| LeafError::Database(error.to_string()))?;
     imagebox.set_setting("browser_settings", &value)
 }
 
@@ -2035,5 +1995,89 @@ fn empty_fallback(value: &str) -> &str {
         "-"
     } else {
         value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leaf_core::domain::{SeriesUid, SopInstanceUid, StudyUid};
+    use leaf_tools::measurement::Measurement;
+
+    fn instance(
+        sop_uid: &str,
+        instance_number: Option<i32>,
+        ipp: Option<[f64; 3]>,
+        iop: Option<[f64; 6]>,
+    ) -> InstanceInfo {
+        InstanceInfo {
+            sop_instance_uid: SopInstanceUid(sop_uid.to_string()),
+            series_uid: SeriesUid("series".to_string()),
+            study_uid: StudyUid("study".to_string()),
+            sop_class_uid: String::new(),
+            instance_number,
+            image_position_patient: ipp,
+            image_orientation_patient: iop,
+            transfer_syntax_uid: String::new(),
+            file_path: None,
+        }
+    }
+
+    #[test]
+    fn sorts_instances_by_patient_position_when_geometry_is_available() {
+        let iop = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let mut instances = vec![
+            instance("3", Some(30), Some([0.0, 0.0, 2.0]), Some(iop)),
+            instance("1", Some(10), Some([0.0, 0.0, 0.0]), Some(iop)),
+            instance("2", Some(20), Some([0.0, 0.0, 1.0]), Some(iop)),
+        ];
+
+        sort_instances_for_stack(&mut instances);
+
+        let ordered_numbers = instances
+            .iter()
+            .map(|instance| instance.instance_number.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ordered_numbers, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn falls_back_to_instance_number_when_geometry_is_missing() {
+        let mut instances = vec![
+            instance("3", Some(30), None, None),
+            instance("1", Some(10), None, None),
+            instance("2", Some(20), None, None),
+        ];
+
+        sort_instances_for_stack(&mut instances);
+
+        let ordered_numbers = instances
+            .iter()
+            .map(|instance| instance.instance_number.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ordered_numbers, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn maps_viewport_points_into_image_space_with_contain_fit() {
+        let geometry = displayed_image_geometry(800.0, 600.0, 512, 256, 1.0, 0.0, 0.0).unwrap();
+        assert!((geometry.image_origin_y - 100.0).abs() < 0.001);
+        assert!((geometry.image_width - 800.0).abs() < 0.001);
+        assert!((geometry.image_height - 400.0).abs() < 0.001);
+
+        let normalized_x = (400.0 - geometry.image_origin_x) / geometry.image_width;
+        let normalized_y = (300.0 - geometry.image_origin_y) / geometry.image_height;
+        let image_point = DVec2::new(normalized_x as f64 * 512.0, normalized_y as f64 * 256.0);
+
+        assert!((image_point.x - 256.0).abs() < 0.001);
+        assert!((image_point.y - 128.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn formats_line_measurement_values_in_millimeters() {
+        let measurement =
+            Measurement::line("series", 0, DVec2::new(0.0, 0.0), DVec2::new(3.0, 4.0));
+
+        assert_eq!(measurement_value_text(&measurement, (1.0, 1.0)), "5.00 mm");
     }
 }

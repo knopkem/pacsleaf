@@ -29,8 +29,8 @@ pub fn decode_frame_with_window(
     window_override: Option<(f64, f64)>,
 ) -> LeafResult<DecodedFrame> {
     let file = FileFormat::open(path).map_err(|e| LeafError::DicomParse(e.to_string()))?;
-    let mut image =
-        DicomImage::from_dataset(&file.dataset).map_err(|e| LeafError::DicomParse(e.to_string()))?;
+    let mut image = DicomImage::from_dataset(&file.dataset)
+        .map_err(|e| LeafError::DicomParse(e.to_string()))?;
 
     if let Some((center, width)) = window_override {
         image

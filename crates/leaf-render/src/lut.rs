@@ -40,14 +40,9 @@ impl ColorLut {
         for (i, entry) in table.iter_mut().enumerate() {
             let t = i as f32 / 255.0;
             let r = (t * 3.0).min(1.0);
-            let g = ((t - 0.333) * 3.0).max(0.0).min(1.0);
-            let b = ((t - 0.666) * 3.0).max(0.0).min(1.0);
-            *entry = [
-                (r * 255.0) as u8,
-                (g * 255.0) as u8,
-                (b * 255.0) as u8,
-                255,
-            ];
+            let g = ((t - 0.333) * 3.0).clamp(0.0, 1.0);
+            let b = ((t - 0.666) * 3.0).clamp(0.0, 1.0);
+            *entry = [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, 255];
         }
         Self {
             name: "hot_iron".to_string(),

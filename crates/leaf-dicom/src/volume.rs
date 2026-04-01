@@ -25,10 +25,7 @@ struct SliceEntry {
 /// Assemble a 3D volume from a sorted list of DICOM file paths.
 ///
 /// Files must belong to the same series and have consistent geometry.
-pub fn assemble_volume(
-    file_paths: &[String],
-    _series_uid: &SeriesUid,
-) -> LeafResult<Volume<i16>> {
+pub fn assemble_volume(file_paths: &[String], _series_uid: &SeriesUid) -> LeafResult<Volume<i16>> {
     if file_paths.is_empty() {
         return Err(LeafError::VolumeAssembly("No files provided".into()));
     }
@@ -102,9 +99,7 @@ pub fn assemble_volume(
     let first_ds = &first_file.dataset;
 
     let spacing = extract_spacing(first_ds, &entries);
-    let origin = entries[0]
-        .image_position
-        .unwrap_or(DVec3::ZERO);
+    let origin = entries[0].image_position.unwrap_or(DVec3::ZERO);
     let direction = extract_orientation(first_ds);
 
     let volume = Volume::from_data(
@@ -133,14 +128,14 @@ fn extract_position(ds: &dicom_toolkit_data::DataSet) -> Option<DVec3> {
     }
 }
 
-fn extract_spacing(
-    ds: &dicom_toolkit_data::DataSet,
-    entries: &[SliceEntry],
-) -> DVec3 {
+fn extract_spacing(ds: &dicom_toolkit_data::DataSet, entries: &[SliceEntry]) -> DVec3 {
     let pixel_spacing = ds
         .get_string(PIXEL_SPACING)
         .and_then(|s| {
-            let parts: Vec<f64> = s.split('\\').filter_map(|p| p.trim().parse().ok()).collect();
+            let parts: Vec<f64> = s
+                .split('\\')
+                .filter_map(|p| p.trim().parse().ok())
+                .collect();
             if parts.len() >= 2 {
                 Some((parts[0], parts[1]))
             } else {
@@ -166,7 +161,10 @@ fn extract_spacing(
 fn extract_orientation(ds: &dicom_toolkit_data::DataSet) -> DMat3 {
     ds.get_string(tags::IMAGE_ORIENTATION_PATIENT)
         .and_then(|s| {
-            let parts: Vec<f64> = s.split('\\').filter_map(|p| p.trim().parse().ok()).collect();
+            let parts: Vec<f64> = s
+                .split('\\')
+                .filter_map(|p| p.trim().parse().ok())
+                .collect();
             if parts.len() >= 6 {
                 let row = DVec3::new(parts[0], parts[1], parts[2]);
                 let col = DVec3::new(parts[3], parts[4], parts[5]);
