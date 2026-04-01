@@ -28,17 +28,6 @@ cargo run -p leaf-app -- --import /path/to/study-or-folder --import /path/to/ano
 
 When the browser is open in `Local` mode, the `Import Folder...` button opens a native folder picker and indexes any DICOM files it finds in the selected directory.
 
-## Configuration
-
-Runtime configuration is now handled **inside the app**:
-
-- Click the `⚙` button in the study browser to open the network drawer
-- Configure the PACS node name, DIMSE host / port / AE titles, and DICOMweb URL as needed
-- Add an optional bearer token for DICOMweb authentication
-- Click `Save`
-
-These settings are persisted in the local imagebox database, not a TOML file.
-
 ## Testing
 
 1. Launch the app:
