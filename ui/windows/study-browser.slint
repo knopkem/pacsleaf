@@ -3,6 +3,7 @@
 
 import { Theme } from "../theme/theme.slint";
 import { StatusBar } from "../components/status-bar.slint";
+import { ToolbarButton } from "../components/toolbar-button.slint";
 
 // Model for a study row in the browser.
 export struct StudyEntry {
@@ -25,10 +26,23 @@ export component StudyBrowserWindow inherits Window {
 
     in property <[StudyEntry]> studies: [];
     in property <string> connection-status: "Disconnected";
+    in-out property <bool> network-mode: false;
+    in-out property <bool> settings-visible: false;
+    in-out property <string> node-name: "";
+    in-out property <string> local-ae-title: "";
+    in-out property <string> dimse-host: "";
+    in-out property <string> dimse-port: "";
+    in-out property <string> remote-ae-title: "";
+    in-out property <string> dicomweb-url: "";
+    in-out property <string> auth-token: "";
 
     callback search(string, string, string);
     callback open-study(string);
     callback import-files();
+    callback activate-local();
+    callback activate-network();
+    callback toggle-settings();
+    callback save-settings(string, string, string, string, string, string, string);
 
     VerticalLayout {
         // Top navigation bar
@@ -64,13 +78,17 @@ export component StudyBrowserWindow inherits Window {
                         width: 80px;
                         height: 32px;
                         border-radius: Theme.radius-md;
-                        background: Theme.accent-primary;
+                        background: !root.network-mode ? Theme.accent-primary : Theme.surface-elevated;
                         Text {
                             text: "Local";
-                            color: Theme.text-primary;
+                            color: !root.network-mode ? Theme.text-primary : Theme.text-secondary;
                             font-size: Theme.font-sm;
                             horizontal-alignment: center;
                             vertical-alignment: center;
+                        }
+                        local-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.activate-local(); }
                         }
                     }
 
@@ -78,46 +96,39 @@ export component StudyBrowserWindow inherits Window {
                         width: 80px;
                         height: 32px;
                         border-radius: Theme.radius-md;
-                        background: Theme.surface-elevated;
+                        background: root.network-mode ? Theme.accent-primary : Theme.surface-elevated;
                         Text {
                             text: "Network";
-                            color: Theme.text-secondary;
+                            color: root.network-mode ? Theme.text-primary : Theme.text-secondary;
                             font-size: Theme.font-sm;
                             horizontal-alignment: center;
                             vertical-alignment: center;
+                        }
+                        network-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.activate-network(); }
                         }
                     }
 
-                    Rectangle {
-                        width: 80px;
-                        height: 32px;
-                        border-radius: Theme.radius-md;
-                        background: Theme.surface-elevated;
-                        TouchArea {
-                            clicked => { root.import-files(); }
-                        }
-                        Text {
-                            text: "Import";
-                            color: Theme.text-secondary;
-                            font-size: Theme.font-sm;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
                 }
 
                 // Settings
                 Rectangle {
-                    width: 32px;
+                    width: 40px;
                     height: 32px;
                     border-radius: Theme.radius-md;
+                    background: root.settings-visible ? Theme.accent-primary : Theme.surface-elevated;
 
                     Text {
                         text: "⚙";
                         font-size: Theme.font-xl;
-                        color: Theme.text-secondary;
+                        color: root.settings-visible ? Theme.text-primary : Theme.text-secondary;
                         horizontal-alignment: center;
                         vertical-alignment: center;
+                    }
+                    settings-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.toggle-settings(); }
                     }
                 }
             }
@@ -235,6 +246,28 @@ export component StudyBrowserWindow inherits Window {
                             vertical-alignment: center;
                         }
                     }
+
+                    if !root.network-mode: Rectangle {
+                        height: 36px;
+                        border-radius: Theme.radius-md;
+                        background: import-touch.has-hover ? #ffffff10 : Theme.surface-elevated;
+                        border-width: 1px;
+                        border-color: Theme.border;
+
+                        import-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.import-files(); }
+                        }
+
+                        Text {
+                            text: "Import Folder...";
+                            color: Theme.accent-primary;
+                            font-size: Theme.font-sm;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
                 }
             }
 
@@ -295,6 +328,191 @@ export component StudyBrowserWindow inherits Window {
                                     background: Theme.border;
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            if settings-visible: Rectangle {
+                width: 300px;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                VerticalLayout {
+                    padding: Theme.spacing-lg;
+                    spacing: Theme.spacing-md;
+
+                    Text {
+                        text: "Network";
+                        color: Theme.text-primary;
+                        font-size: Theme.font-lg;
+                        font-weight: 600;
+                    }
+
+                    Text {
+                        text: "PACS node name";
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-xs;
+                    }
+                    Rectangle {
+                        height: 34px;
+                        border-radius: Theme.radius-sm;
+                        background: Theme.surface-elevated;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        node-name-input := TextInput {
+                            text <=> root.node-name;
+                            color: Theme.text-primary;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: "DIMSE";
+                        color: Theme.text-primary;
+                        font-size: Theme.font-sm;
+                        font-weight: 600;
+                    }
+
+                    Text {
+                        text: "Local AE title";
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-xs;
+                    }
+                    Rectangle {
+                        height: 34px;
+                        border-radius: Theme.radius-sm;
+                        background: Theme.surface-elevated;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        local-ae-title-input := TextInput {
+                            text <=> root.local-ae-title;
+                            color: Theme.text-primary;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: "Remote host";
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-xs;
+                    }
+                    Rectangle {
+                        height: 34px;
+                        border-radius: Theme.radius-sm;
+                        background: Theme.surface-elevated;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        dimse-host-input := TextInput {
+                            text <=> root.dimse-host;
+                            color: Theme.text-primary;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: "Remote port";
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-xs;
+                    }
+                    Rectangle {
+                        height: 34px;
+                        border-radius: Theme.radius-sm;
+                        background: Theme.surface-elevated;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        dimse-port-input := TextInput {
+                            text <=> root.dimse-port;
+                            color: Theme.text-primary;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: "Remote AE title";
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-xs;
+                    }
+                    Rectangle {
+                        height: 34px;
+                        border-radius: Theme.radius-sm;
+                        background: Theme.surface-elevated;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        remote-ae-title-input := TextInput {
+                            text <=> root.remote-ae-title;
+                            color: Theme.text-primary;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: "DICOMweb";
+                        color: Theme.text-primary;
+                        font-size: Theme.font-sm;
+                        font-weight: 600;
+                    }
+
+                    Text {
+                        text: "DICOMweb URL";
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-xs;
+                    }
+                    Rectangle {
+                        height: 34px;
+                        border-radius: Theme.radius-sm;
+                        background: Theme.surface-elevated;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        dicomweb-url-input := TextInput {
+                            text <=> root.dicomweb-url;
+                            color: Theme.text-primary;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: "Bearer token";
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-xs;
+                    }
+                    Rectangle {
+                        height: 34px;
+                        border-radius: Theme.radius-sm;
+                        background: Theme.surface-elevated;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        auth-token-input := TextInput {
+                            text <=> root.auth-token;
+                            color: Theme.text-primary;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Rectangle { }
+
+                    ToolbarButton {
+                        width: 84px;
+                        label: "Save";
+                        active: true;
+                        clicked => {
+                            root.save-settings(
+                                node-name-input.text,
+                                local-ae-title-input.text,
+                                dimse-host-input.text,
+                                dimse-port-input.text,
+                                remote-ae-title-input.text,
+                                dicomweb-url-input.text,
+                                auth-token-input.text,
+                            );
                         }
                     }
                 }

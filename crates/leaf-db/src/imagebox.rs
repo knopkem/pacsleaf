@@ -270,4 +270,23 @@ impl Imagebox {
         info!("Deleted study {}", study_uid);
         Ok(())
     }
+
+    pub fn get_setting(&self, key: &str) -> LeafResult<Option<String>> {
+        let txn = self.db.begin_read().map_err(db_err)?;
+        let table = txn.open_table(SETTINGS).map_err(db_err)?;
+        match table.get(key).map_err(db_err)? {
+            Some(value) => Ok(Some(value.value().to_string())),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> LeafResult<()> {
+        let txn = self.db.begin_write().map_err(db_err)?;
+        {
+            let mut table = txn.open_table(SETTINGS).map_err(db_err)?;
+            table.insert(key, value).map_err(db_err)?;
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(())
+    }
 }

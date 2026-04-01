@@ -21,32 +21,52 @@ cargo run --release -p leaf-app
 
 # Run with debug logging
 RUST_LOG=debug cargo run -p leaf-app
+
+# Import one or more local DICOM files/folders before launch
+cargo run -p leaf-app -- --import /path/to/study-or-folder --import /path/to/another-folder
 ```
+
+When the browser is open in `Local` mode, the `Import Folder...` button opens a native folder picker and indexes any DICOM files it finds in the selected directory.
 
 ## Configuration
 
-Configuration is stored in `~/.config/pacsleaf/pacsleaf.toml` (Linux/macOS) or `%APPDATA%/pacsleaf/pacsleaf.toml` (Windows).
+Runtime configuration is now handled **inside the app**:
 
-```toml
-[general]
-ae_title = "PACSLEAF"
-port = 11114
+- Click the `⚙` button in the study browser to open the network drawer
+- Configure the PACS node name, DIMSE host / port / AE titles, and DICOMweb URL as needed
+- Add an optional bearer token for DICOMweb authentication
+- Click `Save`
 
-[database]
-cache_size_mb = 512
+These settings are persisted in the local imagebox database, not a TOML file.
 
-[display]
-default_lut = "grayscale"
-default_layout = "1x1"
+## Testing
 
-[[nodes]]
-name = "pacsnode-local"
-host = "127.0.0.1"
-port = 4242
-ae_title = "PACSNODE"
-protocol = "both"
-dicomweb_url = "http://localhost:3000/wado"
+1. Launch the app:
+
+```bash
+cargo run -p leaf-app
 ```
+
+2. In `Local` mode, click `Import Folder...` and choose a folder that contains DICOM files.
+
+3. Wait for pacsleaf to index the selected folder.
+
+4. Double-click a local study row to open it in the viewer.
+
+5. In the viewer:
+
+- Use the mouse wheel to scroll slices / frames
+- Click series thumbnails on the left to switch series
+- Toggle the measurement panel with the `Meas` toolbar button
+
+6. To test remote DICOMweb:
+
+- Open `⚙`
+- Enter a node name and DICOMweb base URL in the network drawer
+- Click `Save`
+- Click `Network`
+- Search by patient name / ID / accession
+- Double-click a remote result row to open the first rendered frame
 
 ## Dependencies
 

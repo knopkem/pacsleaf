@@ -39,44 +39,34 @@ impl DicomWebClient {
         &self,
         params: &[(&str, &str)],
     ) -> LeafResult<Vec<Value>> {
-        let url = format!("{}/studies", self.base_url);
-        let mut request = self.client.get(&url);
-
-        if let Some(token) = &self.auth_token {
-            request = request.bearer_auth(token);
-        }
-
-        for (key, value) in params {
-            request = request.query(&[(key, value)]);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| LeafError::DicomWeb {
-                status: 0,
-                message: e.to_string(),
-            })?;
-
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(LeafError::DicomWeb {
-                status,
-                message: body,
-            });
-        }
-
-        let studies: Vec<Value> = response
-            .json()
-            .await
-            .map_err(|e| LeafError::DicomWeb {
-                status: 0,
-                message: e.to_string(),
-            })?;
+        let studies = self.get_json(&format!("{}/studies", self.base_url), params).await?;
 
         debug!("QIDO-RS returned {} studies", studies.len());
         Ok(studies)
+    }
+
+    /// QIDO-RS: Search for series within a study.
+    pub async fn search_series(
+        &self,
+        study_uid: &str,
+        params: &[(&str, &str)],
+    ) -> LeafResult<Vec<Value>> {
+        self.get_json(&format!("{}/studies/{study_uid}/series", self.base_url), params)
+            .await
+    }
+
+    /// QIDO-RS: Search for instances within a series.
+    pub async fn search_instances(
+        &self,
+        study_uid: &str,
+        series_uid: &str,
+        params: &[(&str, &str)],
+    ) -> LeafResult<Vec<Value>> {
+        self.get_json(
+            &format!("{}/studies/{study_uid}/series/{series_uid}/instances", self.base_url),
+            params,
+        )
+        .await
     }
 
     /// WADO-RS: Retrieve instance metadata.
@@ -168,5 +158,36 @@ impl DicomWebClient {
             })?;
 
         Ok(bytes.to_vec())
+    }
+
+    async fn get_json(&self, url: &str, params: &[(&str, &str)]) -> LeafResult<Vec<Value>> {
+        let mut request = self.client.get(url);
+
+        if let Some(token) = &self.auth_token {
+            request = request.bearer_auth(token);
+        }
+
+        for (key, value) in params {
+            request = request.query(&[(key, value)]);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| LeafError::DicomWeb {
+                status: 0,
+                message: e.to_string(),
+            })?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(LeafError::DicomWeb { status, message: body });
+        }
+
+        response.json().await.map_err(|e| LeafError::DicomWeb {
+            status: 0,
+            message: e.to_string(),
+        })
     }
 }

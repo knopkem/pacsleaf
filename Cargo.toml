@@ -80,7 +80,9 @@ rayon = "1"
 parking_lot = "0.12"
 bytes = "1"
 base64 = "0.22"
-lru = "0.12"
+lru = "0.16.3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rfd = "0.15"
 
 [profile.dev]
 opt-level = 1

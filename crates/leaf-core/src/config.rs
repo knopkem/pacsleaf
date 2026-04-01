@@ -1,4 +1,4 @@
-//! Application configuration model (TOML-based).
+//! Application settings model and platform defaults.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -87,7 +87,7 @@ pub enum PacsProtocol {
 }
 
 impl AppConfig {
-    /// Load configuration from a TOML file, falling back to defaults.
+    /// Load configuration from disk, falling back to defaults.
     pub fn load(path: &std::path::Path) -> Result<Self, crate::error::LeafError> {
         if path.exists() {
             let contents = std::fs::read_to_string(path)?;
@@ -98,7 +98,7 @@ impl AppConfig {
         }
     }
 
-    /// Save the current configuration to a TOML file.
+    /// Save the current configuration to disk.
     pub fn save(&self, path: &std::path::Path) -> Result<(), crate::error::LeafError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
