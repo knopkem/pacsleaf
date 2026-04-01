@@ -9,12 +9,13 @@ use image::load_from_memory;
 use leaf_core::config::{data_dir, PacsNodeConfig, PacsProtocol};
 use leaf_core::domain::{InstanceInfo, SeriesInfo, StudyInfo, StudyUid};
 use leaf_core::error::{LeafError, LeafResult};
-use leaf_dicom::metadata::import_dicom_file;
+use leaf_dicom::metadata::{import_dicom_file, read_instance_geometry};
 use leaf_dicom::pixel::{decode_frame, frame_count};
 use leaf_db::imagebox::Imagebox;
 use leaf_net::dicomweb::DicomWebClient;
 use rfd::FileDialog;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -943,7 +944,7 @@ fn open_viewer_for_study(imagebox: &Imagebox, study_uid: &str) -> LeafResult<lea
             let mut instances = imagebox
                 .get_instances_for_series(&series.series_uid)
                 .unwrap_or_default();
-            instances.sort_by(|a, b| a.instance_number.cmp(&b.instance_number));
+            sort_instances_for_stack(&mut instances);
             (series.series_uid.0.clone(), instances)
         })
         .collect::<std::collections::HashMap<_, _>>();
@@ -1141,6 +1142,192 @@ fn build_frames_by_series(
             (series_uid.clone(), frames)
         })
         .collect()
+}
+
+fn sort_instances_for_stack(instances: &mut [InstanceInfo]) {
+    if instances.len() <= 1 {
+        return;
+    }
+
+    hydrate_instance_geometry(instances);
+
+    let mut reference_candidates = instances.iter().collect::<Vec<_>>();
+    reference_candidates.sort_by(|a, b| compare_instances_by_fallback(a, b));
+
+    let Some(reference) = reference_candidates.get(reference_candidates.len() / 2) else {
+        return;
+    };
+
+    let Some(reference_iop) = reference.image_orientation_patient else {
+        instances.sort_by(compare_instances_by_fallback);
+        return;
+    };
+    let Some(reference_ipp) = reference.image_position_patient else {
+        instances.sort_by(compare_instances_by_fallback);
+        return;
+    };
+
+    if !instances.iter().all(|instance| {
+        instance
+            .image_position_patient
+            .zip(instance.image_orientation_patient)
+            .map(|(_, iop)| same_orientation(&iop, &reference_iop))
+            .unwrap_or(false)
+    }) {
+        instances.sort_by(compare_instances_by_fallback);
+        return;
+    }
+
+    let scan_axis_normal = cross_product(
+        [reference_iop[0], reference_iop[1], reference_iop[2]],
+        [reference_iop[3], reference_iop[4], reference_iop[5]],
+    );
+
+    if vector_length(scan_axis_normal) <= 1e-6 {
+        instances.sort_by(compare_instances_by_fallback);
+        return;
+    }
+
+    instances.sort_by(|a, b| {
+        let a_distance = a
+            .image_position_patient
+            .map(|ipp| slice_distance(reference_ipp, ipp, scan_axis_normal));
+        let b_distance = b
+            .image_position_patient
+            .map(|ipp| slice_distance(reference_ipp, ipp, scan_axis_normal));
+
+        match (a_distance, b_distance) {
+            (Some(a_distance), Some(b_distance)) => b_distance
+                .partial_cmp(&a_distance)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| compare_instances_by_fallback(a, b)),
+            _ => compare_instances_by_fallback(a, b),
+        }
+    });
+}
+
+fn hydrate_instance_geometry(instances: &mut [InstanceInfo]) {
+    for instance in instances.iter_mut() {
+        if instance.image_position_patient.is_some() && instance.image_orientation_patient.is_some() {
+            continue;
+        }
+
+        let Some(file_path) = instance.file_path.as_ref() else {
+            continue;
+        };
+
+        let Ok((image_position_patient, image_orientation_patient)) =
+            read_instance_geometry(Path::new(file_path))
+        else {
+            continue;
+        };
+
+        if instance.image_position_patient.is_none() {
+            instance.image_position_patient = image_position_patient;
+        }
+        if instance.image_orientation_patient.is_none() {
+            instance.image_orientation_patient = image_orientation_patient;
+        }
+    }
+}
+
+fn compare_instances_by_fallback(a: &InstanceInfo, b: &InstanceInfo) -> Ordering {
+    let a_number = a.instance_number.unwrap_or(i32::MAX);
+    let b_number = b.instance_number.unwrap_or(i32::MAX);
+
+    a_number
+        .cmp(&b_number)
+        .then_with(|| a.sop_instance_uid.0.cmp(&b.sop_instance_uid.0))
+}
+
+fn same_orientation(a: &[f64; 6], b: &[f64; 6]) -> bool {
+    a.iter()
+        .zip(b.iter())
+        .all(|(lhs, rhs)| (lhs - rhs).abs() <= 1e-4)
+}
+
+fn cross_product(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn vector_length(vector: [f64; 3]) -> f64 {
+    (vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]).sqrt()
+}
+
+fn slice_distance(reference_ipp: [f64; 3], image_ipp: [f64; 3], scan_axis_normal: [f64; 3]) -> f64 {
+    let delta = [
+        reference_ipp[0] - image_ipp[0],
+        reference_ipp[1] - image_ipp[1],
+        reference_ipp[2] - image_ipp[2],
+    ];
+
+    delta[0] * scan_axis_normal[0]
+        + delta[1] * scan_axis_normal[1]
+        + delta[2] * scan_axis_normal[2]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leaf_core::domain::{SeriesUid, SopInstanceUid, StudyUid};
+
+    fn instance(
+        sop_uid: &str,
+        instance_number: Option<i32>,
+        ipp: Option<[f64; 3]>,
+        iop: Option<[f64; 6]>,
+    ) -> InstanceInfo {
+        InstanceInfo {
+            sop_instance_uid: SopInstanceUid(sop_uid.to_string()),
+            series_uid: SeriesUid("series".to_string()),
+            study_uid: StudyUid("study".to_string()),
+            sop_class_uid: String::new(),
+            instance_number,
+            image_position_patient: ipp,
+            image_orientation_patient: iop,
+            transfer_syntax_uid: String::new(),
+            file_path: None,
+        }
+    }
+
+    #[test]
+    fn sorts_instances_by_patient_position_when_geometry_is_available() {
+        let iop = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let mut instances = vec![
+            instance("3", Some(30), Some([0.0, 0.0, 2.0]), Some(iop)),
+            instance("1", Some(10), Some([0.0, 0.0, 0.0]), Some(iop)),
+            instance("2", Some(20), Some([0.0, 0.0, 1.0]), Some(iop)),
+        ];
+
+        sort_instances_for_stack(&mut instances);
+
+        let ordered_numbers = instances
+            .iter()
+            .map(|instance| instance.instance_number.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ordered_numbers, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn falls_back_to_instance_number_when_geometry_is_missing() {
+        let mut instances = vec![
+            instance("3", Some(30), None, None),
+            instance("1", Some(10), None, None),
+            instance("2", Some(20), None, None),
+        ];
+
+        sort_instances_for_stack(&mut instances);
+
+        let ordered_numbers = instances
+            .iter()
+            .map(|instance| instance.instance_number.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ordered_numbers, vec![10, 20, 30]);
+    }
 }
 
 fn load_browser_settings(imagebox: &Imagebox) -> LeafResult<BrowserSettings> {

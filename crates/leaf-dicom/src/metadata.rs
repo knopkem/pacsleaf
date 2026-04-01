@@ -10,6 +10,8 @@ use std::path::Path;
 const BODY_PART_EXAMINED: Tag = Tag::new(0x0018, 0x0015);
 const SLICE_THICKNESS: Tag = Tag::new(0x0018, 0x0050);
 const PIXEL_SPACING: Tag = Tag::new(0x0028, 0x0030);
+const IMAGE_POSITION_PATIENT: Tag = Tag::new(0x0020, 0x0032);
+const IMAGE_ORIENTATION_PATIENT: Tag = Tag::new(0x0020, 0x0037);
 
 /// Extract study-level information from a DICOM dataset.
 pub fn extract_study_info(ds: &DataSet) -> LeafResult<StudyInfo> {
@@ -93,6 +95,8 @@ pub fn extract_instance_info(ds: &DataSet, file_path: Option<String>) -> LeafRes
         study_uid: StudyUid(study_uid),
         sop_class_uid: ds.get_string(tags::SOP_CLASS_UID).unwrap_or("").to_string(),
         instance_number: ds.get_i32(tags::INSTANCE_NUMBER),
+        image_position_patient: extract_multi_float_array::<3>(ds, IMAGE_POSITION_PATIENT),
+        image_orientation_patient: extract_multi_float_array::<6>(ds, IMAGE_ORIENTATION_PATIENT),
         transfer_syntax_uid: String::new(),
         file_path,
     })
@@ -112,6 +116,15 @@ pub fn import_dicom_file(
     Ok((study, series, instance))
 }
 
+pub fn read_instance_geometry(path: &Path) -> LeafResult<(Option<[f64; 3]>, Option<[f64; 6]>)> {
+    let file = FileFormat::open(path).map_err(|e| LeafError::DicomParse(e.to_string()))?;
+    let ds = &file.dataset;
+    Ok((
+        extract_multi_float_array::<3>(ds, IMAGE_POSITION_PATIENT),
+        extract_multi_float_array::<6>(ds, IMAGE_ORIENTATION_PATIENT),
+    ))
+}
+
 fn extract_pixel_spacing(ds: &DataSet) -> Option<(f64, f64)> {
     let spacing_str = ds.get_string(PIXEL_SPACING)?;
     let parts: Vec<&str> = spacing_str.split('\\').collect();
@@ -122,6 +135,24 @@ fn extract_pixel_spacing(ds: &DataSet) -> Option<(f64, f64)> {
     } else {
         None
     }
+}
+
+fn extract_multi_float_array<const N: usize>(ds: &DataSet, tag: Tag) -> Option<[f64; N]> {
+    let values = ds.get_string(tag)?;
+    let parts = values
+        .split('\\')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < N {
+        return None;
+    }
+
+    let mut parsed = [0.0_f64; N];
+    for (index, part) in parts.iter().take(N).enumerate() {
+        parsed[index] = part.parse::<f64>().ok()?;
+    }
+    Some(parsed)
 }
 
 fn parse_dicom_date(s: &str) -> Option<chrono::NaiveDate> {

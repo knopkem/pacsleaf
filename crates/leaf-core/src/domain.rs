@@ -63,6 +63,10 @@ pub struct InstanceInfo {
     pub study_uid: StudyUid,
     pub sop_class_uid: String,
     pub instance_number: Option<i32>,
+    #[serde(default)]
+    pub image_position_patient: Option<[f64; 3]>,
+    #[serde(default)]
+    pub image_orientation_patient: Option<[f64; 6]>,
     pub transfer_syntax_uid: String,
     pub file_path: Option<String>,
 }
