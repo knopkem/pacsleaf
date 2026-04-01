@@ -5,3 +5,8 @@
 
 pub mod lut;
 pub mod viewport;
+pub mod volume;
+
+pub use volume::{
+    PreparedVolume, VolumeBlendMode, VolumePreviewImage, VolumePreviewRenderer, VolumeViewState,
+};

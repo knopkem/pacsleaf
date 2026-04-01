@@ -68,6 +68,7 @@ export component StudyViewerWindow inherits Window {
     in property <string> zoom-info: "100%";
     in property <image> viewport-image;
     in property <bool> measurement-panel-visible: false;
+    in property <bool> volume-preview-active: false;
     in-out property <float> viewport-scale: 1.0;
     in-out property <float> viewport-offset-x: 0.0;
     in-out property <float> viewport-offset-y: 0.0;
@@ -81,6 +82,7 @@ export component StudyViewerWindow inherits Window {
     callback measurement-clicked(string);
     callback reset-view();
     callback toggle-measurements();
+    callback toggle-volume-preview();
 
     viewer-focus := FocusScope {
         width: parent.width;
@@ -159,6 +161,11 @@ export component StudyViewerWindow inherits Window {
                     label: "Meas";
                     active: measurement-panel-visible;
                     clicked => { root.toggle-measurements(); }
+                }
+                ToolbarButton {
+                    label: "DVR";
+                    active: volume-preview-active;
+                    clicked => { root.toggle-volume-preview(); }
                 }
 
                 Rectangle { }

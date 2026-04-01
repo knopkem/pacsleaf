@@ -514,6 +514,7 @@ fn open_remote_viewer_for_study(
     viewer.set_patient_name(patient_name.into());
     viewer.set_study_description(study_description.into());
     viewer.set_measurement_panel_visible(false);
+    viewer.set_volume_preview_active(false);
     viewer.set_measurements(ModelRc::from(Rc::new(VecModel::from(Vec::<
         leaf_ui::MeasurementEntry,
     >::new()))));
@@ -537,6 +538,7 @@ fn open_remote_viewer_for_study(
     let shared_series = Rc::new(series_list);
 
     let viewer_weak = viewer.as_weak();
+    let viewer_weak_for_volume = viewer.as_weak();
     let series_for_callback = shared_series.clone();
     let client_for_callback = shared_client.clone();
     let study_uid_for_callback = remote_study_uid.clone();
@@ -552,6 +554,11 @@ fn open_remote_viewer_for_study(
             ) {
                 viewer.set_study_description(format!("Remote open failed: {error}").into());
             }
+        }
+    });
+    viewer.on_toggle_volume_preview(move || {
+        if let Some(viewer) = viewer_weak_for_volume.upgrade() {
+            viewer.set_connection_status("3D preview is only available for local studies".into());
         }
     });
 
@@ -636,6 +643,7 @@ fn update_remote_viewer_image(
         leaf_ui::image_from_rgba8(rgba.width(), rgba.height(), rgba.into_raw())
             .map_err(|error| LeafError::Render(error.to_string()))?,
     );
+    viewer.set_volume_preview_active(false);
     viewer.set_window_info("Remote render".into());
     viewer.set_slice_info("1/1".into());
     viewer.set_zoom_info("Fit".into());

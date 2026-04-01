@@ -18,3 +18,4 @@ thiserror = { workspace = true }
 bytemuck = { workspace = true }
 lru = { workspace = true }
 parking_lot = { workspace = true }
+pollster = { workspace = true }

@@ -1,16 +1,17 @@
 //! Local viewer state and rendering flow for pacsleaf.
 
 use glam::DVec2;
-use leaf_core::domain::{InstanceInfo, SeriesInfo, StudyUid};
+use leaf_core::domain::{InstanceInfo, SeriesInfo, SeriesUid, StudyUid};
 use leaf_core::error::{LeafError, LeafResult};
 use leaf_db::imagebox::Imagebox;
 use leaf_dicom::metadata::read_instance_geometry;
 use leaf_dicom::pixel::{decode_frame_with_window, frame_count};
+use leaf_render::{PreparedVolume, VolumePreviewImage, VolumePreviewRenderer, VolumeViewState};
 use leaf_tools::measurement::{Measurement, MeasurementKind, MeasurementValue};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::rc::Rc;
 use tracing::info;
@@ -24,6 +25,7 @@ struct ViewerSession {
     active_series_uid: String,
     active_frame_index: usize,
     measurement_panel_visible: bool,
+    volume_preview_active: bool,
     active_tool: leaf_ui::ViewerTool,
     viewport_scale: f32,
     viewport_offset_x: f32,
@@ -39,6 +41,10 @@ struct ViewerSession {
     selected_measurement_id: Option<String>,
     draft_measurement: Option<DraftMeasurement>,
     drag_state: Option<ViewportDragState>,
+    volume_drag_state: Option<VolumeDragState>,
+    volume_renderer: Option<VolumePreviewRenderer>,
+    prepared_volumes_by_series: HashMap<String, PreparedVolume>,
+    volume_view_state_by_series: HashMap<String, VolumeViewState>,
 }
 
 #[derive(Clone)]
@@ -56,6 +62,13 @@ struct ViewportDragState {
     start_scale: f32,
     start_window_center: f64,
     start_window_width: f64,
+}
+
+#[derive(Clone, Copy)]
+struct VolumeDragState {
+    origin_x: f32,
+    origin_y: f32,
+    start_view_state: VolumeViewState,
 }
 
 #[derive(Clone)]
@@ -101,6 +114,7 @@ pub(crate) fn open_viewer_for_study(
     viewer.set_patient_name(study.patient.patient_name.clone().into());
     viewer.set_connection_status("Local imagebox".into());
     viewer.set_active_tool(leaf_ui::ViewerTool::WindowLevel);
+    viewer.set_volume_preview_active(false);
     viewer.set_study_description(
         study
             .study_description
@@ -123,6 +137,7 @@ pub(crate) fn open_viewer_for_study(
         active_series_uid,
         active_frame_index: 0,
         measurement_panel_visible: false,
+        volume_preview_active: false,
         active_tool: leaf_ui::ViewerTool::WindowLevel,
         viewport_scale: 1.0,
         viewport_offset_x: 0.0,
@@ -138,6 +153,10 @@ pub(crate) fn open_viewer_for_study(
         selected_measurement_id: None,
         draft_measurement: None,
         drag_state: None,
+        volume_drag_state: None,
+        volume_renderer: None,
+        prepared_volumes_by_series: HashMap::new(),
+        volume_view_state_by_series: HashMap::new(),
     }));
 
     {
@@ -156,14 +175,19 @@ pub(crate) fn open_viewer_for_study(
     let session_for_series = session.clone();
     viewer.on_series_selected(move |series_uid| {
         let mut session = session_for_series.borrow_mut();
+        let preview_active = session.volume_preview_active;
         session.active_series_uid = series_uid.to_string();
         session.active_frame_index = 0;
         session.selected_measurement_id = None;
         session.draft_measurement = None;
         reset_viewport_state(&mut session, true);
-        let result = update_series_model(&session)
-            .and_then(|_| update_viewer_image(&mut session))
-            .and_then(|_| update_measurements_model(&session));
+        let result = update_series_model(&session).and_then(|_| {
+            if preview_active {
+                render_or_show_volume_preview(&mut session)
+            } else {
+                update_viewer_image(&mut session).and_then(|_| update_measurements_model(&session))
+            }
+        });
         if let Err(error) = result {
             info!("Failed to switch series: {}", error);
         }
@@ -174,6 +198,7 @@ pub(crate) fn open_viewer_for_study(
         let mut session = session_for_tool.borrow_mut();
         session.active_tool = tool;
         session.drag_state = None;
+        session.volume_drag_state = None;
         session.draft_measurement = None;
         if let Err(error) = apply_viewport_state(&session) {
             info!("Failed to switch tool: {}", error);
@@ -183,6 +208,20 @@ pub(crate) fn open_viewer_for_study(
     let session_for_scroll = session.clone();
     viewer.on_viewport_scroll(move |delta| {
         let mut session = session_for_scroll.borrow_mut();
+        if session.volume_preview_active {
+            let zoom_factor = if delta > 0.0 {
+                1.1
+            } else if delta < 0.0 {
+                0.9
+            } else {
+                1.0
+            };
+            active_volume_view_state(&mut session).zoom_by(zoom_factor);
+            if let Err(error) = render_or_show_volume_preview(&mut session) {
+                info!("Failed to zoom volume preview: {}", error);
+            }
+            return;
+        }
         session.draft_measurement = None;
         let step = if delta < 0.0 {
             1
@@ -207,6 +246,15 @@ pub(crate) fn open_viewer_for_study(
     viewer.on_viewport_mouse_down(move |x, y, viewport_width, viewport_height| {
         let mut session = session_for_mouse_down.borrow_mut();
         update_viewport_dimensions(&mut session, viewport_width, viewport_height);
+        if session.volume_preview_active {
+            session.drag_state = None;
+            session.volume_drag_state = Some(VolumeDragState {
+                origin_x: x,
+                origin_y: y,
+                start_view_state: *active_volume_view_state(&mut session),
+            });
+            return;
+        }
         match session.active_tool {
             leaf_ui::ViewerTool::WindowLevel
             | leaf_ui::ViewerTool::Pan
@@ -240,6 +288,10 @@ pub(crate) fn open_viewer_for_study(
     viewer.on_viewport_mouse_up(move |x, y, viewport_width, viewport_height| {
         let mut session = session_for_mouse_up.borrow_mut();
         update_viewport_dimensions(&mut session, viewport_width, viewport_height);
+        if session.volume_preview_active {
+            session.volume_drag_state = None;
+            return;
+        }
 
         if matches!(session.active_tool, leaf_ui::ViewerTool::Line) {
             if let Some(end) = viewport_to_image_point(&session, x, y, true) {
@@ -260,6 +312,18 @@ pub(crate) fn open_viewer_for_study(
     viewer.on_viewport_mouse_move(move |x, y, viewport_width, viewport_height| {
         let mut session = session_for_mouse_move.borrow_mut();
         update_viewport_dimensions(&mut session, viewport_width, viewport_height);
+        if session.volume_preview_active {
+            let Some(drag_state) = session.volume_drag_state else {
+                return;
+            };
+            let dx = x - drag_state.origin_x;
+            let dy = y - drag_state.origin_y;
+            apply_volume_drag(&mut session, drag_state.start_view_state, dx, dy);
+            if let Err(error) = render_or_show_volume_preview(&mut session) {
+                info!("Failed to update volume preview interaction: {}", error);
+            }
+            return;
+        }
 
         if matches!(session.active_tool, leaf_ui::ViewerTool::Line) {
             if let Some(end) = viewport_to_image_point(&session, x, y, true) {
@@ -311,11 +375,17 @@ pub(crate) fn open_viewer_for_study(
     let session_for_reset = session.clone();
     viewer.on_reset_view(move || {
         let mut session = session_for_reset.borrow_mut();
-        session.active_frame_index = 0;
-        session.selected_measurement_id = None;
-        session.draft_measurement = None;
-        reset_viewport_state(&mut session, false);
-        if let Err(error) = update_viewer_image(&mut session) {
+        let result = if session.volume_preview_active {
+            active_volume_view_state(&mut session).reset();
+            render_or_show_volume_preview(&mut session)
+        } else {
+            session.active_frame_index = 0;
+            session.selected_measurement_id = None;
+            session.draft_measurement = None;
+            reset_viewport_state(&mut session, false);
+            update_viewer_image(&mut session).and_then(|_| update_measurements_model(&session))
+        };
+        if let Err(error) = result {
             info!("Failed to reset view: {}", error);
         }
     });
@@ -378,6 +448,25 @@ pub(crate) fn open_viewer_for_study(
         }
     });
 
+    let session_for_volume_toggle = session.clone();
+    viewer.on_toggle_volume_preview(move || {
+        let mut session = session_for_volume_toggle.borrow_mut();
+        let result = if session.volume_preview_active {
+            session.volume_preview_active = false;
+            session.volume_drag_state = None;
+            update_viewer_image(&mut session).and_then(|_| update_measurements_model(&session))
+        } else {
+            render_or_show_volume_preview(&mut session)
+        };
+        if let Err(error) = result {
+            session.volume_preview_active = false;
+            if let Some(viewer) = session.viewer.upgrade() {
+                viewer.set_volume_preview_active(false);
+                viewer.set_connection_status(format!("3D preview failed: {error}").into());
+            }
+        }
+    });
+
     viewer
         .show()
         .map_err(|error| LeafError::Render(error.to_string()))?;
@@ -418,6 +507,10 @@ fn update_measurements_model(session: &ViewerSession) -> LeafResult<()> {
         .viewer
         .upgrade()
         .ok_or_else(|| LeafError::Render("Viewer window no longer available".into()))?;
+    if session.volume_preview_active {
+        viewer.set_measurements(empty_measurement_model());
+        return Ok(());
+    }
     let pixel_spacing = active_pixel_spacing(session);
     let entries = session
         .measurements_by_series
@@ -431,6 +524,44 @@ fn update_measurements_model(session: &ViewerSession) -> LeafResult<()> {
         .unwrap_or_default();
     viewer.set_measurements(ModelRc::from(Rc::new(VecModel::from(entries))));
     Ok(())
+}
+
+fn active_volume_view_state(session: &mut ViewerSession) -> &mut VolumeViewState {
+    session
+        .volume_view_state_by_series
+        .entry(session.active_series_uid.clone())
+        .or_default()
+}
+
+fn apply_volume_drag(
+    session: &mut ViewerSession,
+    start_view_state: VolumeViewState,
+    delta_x: f32,
+    delta_y: f32,
+) {
+    let active_tool = session.active_tool;
+    let view_state = active_volume_view_state(session);
+    *view_state = start_view_state;
+    match active_tool {
+        leaf_ui::ViewerTool::Pan => view_state.pan(delta_x as f64, delta_y as f64),
+        leaf_ui::ViewerTool::Zoom => {
+            let factor = (1.0 - delta_y as f64 * 0.01).clamp(0.25, 4.0);
+            view_state.zoom_by(factor);
+        }
+        _ => view_state.orbit(delta_x as f64 * 0.45, delta_y as f64 * 0.35),
+    }
+}
+
+fn empty_measurement_model() -> ModelRc<leaf_ui::MeasurementEntry> {
+    ModelRc::from(Rc::new(VecModel::from(
+        Vec::<leaf_ui::MeasurementEntry>::new(),
+    )))
+}
+
+fn empty_measurement_overlay_model() -> ModelRc<leaf_ui::MeasurementOverlay> {
+    ModelRc::from(Rc::new(VecModel::from(
+        Vec::<leaf_ui::MeasurementOverlay>::new(),
+    )))
 }
 
 fn update_viewport_dimensions(
@@ -503,6 +634,10 @@ fn update_measurement_overlays(session: &ViewerSession) -> LeafResult<()> {
         .viewer
         .upgrade()
         .ok_or_else(|| LeafError::Render("Viewer window no longer available".into()))?;
+    if session.volume_preview_active {
+        viewer.set_measurement_overlays(empty_measurement_overlay_model());
+        return Ok(());
+    }
     let pixel_spacing = active_pixel_spacing(session);
 
     let mut overlays = session
@@ -716,6 +851,9 @@ pub(crate) fn install_viewer_tool_state(viewer: &leaf_ui::StudyViewerWindow) {
 }
 
 fn update_viewer_image(session: &mut ViewerSession) -> LeafResult<()> {
+    if session.volume_preview_active {
+        return render_or_show_volume_preview(session);
+    }
     let frames = session
         .frames_by_series
         .get(&session.active_series_uid)
@@ -786,6 +924,23 @@ fn apply_viewport_state(session: &ViewerSession) -> LeafResult<()> {
         .ok_or_else(|| LeafError::Render("Viewer window no longer available".into()))?;
 
     viewer.set_active_tool(session.active_tool);
+    viewer.set_volume_preview_active(session.volume_preview_active);
+
+    if session.volume_preview_active {
+        let volume_zoom = session
+            .volume_view_state_by_series
+            .get(&session.active_series_uid)
+            .map(|state| state.zoom)
+            .unwrap_or(1.0);
+        viewer.set_viewport_scale(1.0);
+        viewer.set_viewport_offset_x(0.0);
+        viewer.set_viewport_offset_y(0.0);
+        viewer.set_window_info("DVR orbit".into());
+        viewer.set_zoom_info(format!("3D {:.0}%", volume_zoom * 100.0).into());
+        update_measurement_overlays(session)?;
+        return Ok(());
+    }
+
     viewer.set_viewport_scale(session.viewport_scale);
     viewer.set_viewport_offset_x(session.viewport_offset_x);
     viewer.set_viewport_offset_y(session.viewport_offset_y);
@@ -800,11 +955,128 @@ fn apply_viewport_state(session: &ViewerSession) -> LeafResult<()> {
     Ok(())
 }
 
+fn render_or_show_volume_preview(session: &mut ViewerSession) -> LeafResult<()> {
+    let series_uid = session.active_series_uid.clone();
+    if !session.prepared_volumes_by_series.contains_key(&series_uid) {
+        let file_paths = active_series_file_paths(session)?;
+        let prepared = {
+            let renderer = ensure_volume_renderer(session)?;
+            renderer.prepare_series_volume(&file_paths, &SeriesUid(series_uid.clone()))?
+        };
+        session
+            .prepared_volumes_by_series
+            .insert(series_uid.clone(), prepared);
+    }
+    let preview_size = preview_dimensions(session);
+    let view_state = session
+        .volume_view_state_by_series
+        .get(&series_uid)
+        .copied()
+        .unwrap_or_default();
+    if session.volume_renderer.is_none() {
+        session.volume_renderer = Some(VolumePreviewRenderer::new()?);
+    }
+    let preview = {
+        let ViewerSession {
+            volume_renderer,
+            prepared_volumes_by_series,
+            ..
+        } = session;
+        let renderer = volume_renderer
+            .as_mut()
+            .ok_or_else(|| LeafError::Render("Volume renderer unavailable".into()))?;
+        let prepared = prepared_volumes_by_series
+            .get(&series_uid)
+            .ok_or_else(|| LeafError::Render("Prepared volume missing".into()))?;
+        renderer.render_prepared_preview(prepared, &view_state, preview_size.0, preview_size.1)?
+    };
+    show_volume_preview(session, &preview)
+}
+
+fn ensure_volume_renderer(session: &mut ViewerSession) -> LeafResult<&mut VolumePreviewRenderer> {
+    if session.volume_renderer.is_none() {
+        session.volume_renderer = Some(VolumePreviewRenderer::new()?);
+    }
+    session
+        .volume_renderer
+        .as_mut()
+        .ok_or_else(|| LeafError::Render("Volume renderer unavailable".into()))
+}
+
+fn active_series_file_paths(session: &ViewerSession) -> LeafResult<Vec<String>> {
+    let instances = session
+        .instances_by_series
+        .get(&session.active_series_uid)
+        .ok_or_else(|| LeafError::NoData("Series has no instances".into()))?;
+    let mut unique_paths = BTreeSet::new();
+    for instance in instances {
+        if let Some(file_path) = instance.file_path.as_ref() {
+            unique_paths.insert(file_path.clone());
+        }
+    }
+    let file_paths = unique_paths.into_iter().collect::<Vec<_>>();
+    if file_paths.is_empty() {
+        return Err(LeafError::NoData(
+            "Series has no local files for volume assembly".into(),
+        ));
+    }
+    Ok(file_paths)
+}
+
+fn preview_dimensions(session: &ViewerSession) -> (u32, u32) {
+    let mut width = if session.viewport_width > 0.0 {
+        session.viewport_width.round() as u32
+    } else {
+        768
+    };
+    let mut height = if session.viewport_height > 0.0 {
+        session.viewport_height.round() as u32
+    } else {
+        768
+    };
+
+    width = width.max(256);
+    height = height.max(256);
+
+    let max_side = width.max(height);
+    if max_side > 768 {
+        let scale = 768.0 / max_side as f32;
+        width = (width as f32 * scale).round().max(256.0) as u32;
+        height = (height as f32 * scale).round().max(256.0) as u32;
+    }
+
+    (width, height)
+}
+
+fn show_volume_preview(
+    session: &mut ViewerSession,
+    preview: &VolumePreviewImage,
+) -> LeafResult<()> {
+    session.volume_preview_active = true;
+    let viewer = session
+        .viewer
+        .upgrade()
+        .ok_or_else(|| LeafError::Render("Viewer window no longer available".into()))?;
+    viewer.set_viewport_image(
+        leaf_ui::image_from_rgba8(preview.width, preview.height, preview.rgba.clone())
+            .map_err(|error| LeafError::Render(error.to_string()))?,
+    );
+    viewer.set_connection_status(
+        "Local imagebox | DVR preview (drag=orbit, Pan/Zoom tools=3D)".into(),
+    );
+    viewer.set_window_info("DVR preview".into());
+    viewer.set_slice_info("3D".into());
+    apply_viewport_state(session)?;
+    update_measurements_model(session)?;
+    Ok(())
+}
+
 fn reset_viewport_state(session: &mut ViewerSession, clear_defaults: bool) {
     session.viewport_scale = 1.0;
     session.viewport_offset_x = 0.0;
     session.viewport_offset_y = 0.0;
     session.drag_state = None;
+    session.volume_drag_state = None;
 
     if clear_defaults {
         session.window_center = None;
