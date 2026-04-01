@@ -37,6 +37,16 @@ export struct MeasurementEntry {
     slice-index: int,
 }
 
+export struct MeasurementOverlay {
+    id: string,
+    commands: string,
+    label-x: float,
+    label-y: float,
+    label: string,
+    selected: bool,
+    draft: bool,
+}
+
 export component StudyViewerWindow inherits Window {
     title: "pacsleaf — Viewer";
     preferred-width: 1440px;
@@ -49,6 +59,7 @@ export component StudyViewerWindow inherits Window {
     in property <ViewerTool> active-tool: ViewerTool.window-level;
     in property <[SeriesThumbnail]> series-list: [];
     in property <[MeasurementEntry]> measurements: [];
+    in property <[MeasurementOverlay]> measurement-overlays: [];
     in property <string> patient-name: "";
     in property <string> study-description: "";
     in property <string> connection-status: "Connected";
@@ -57,12 +68,15 @@ export component StudyViewerWindow inherits Window {
     in property <string> zoom-info: "100%";
     in property <image> viewport-image;
     in property <bool> measurement-panel-visible: false;
+    in-out property <float> viewport-scale: 1.0;
+    in-out property <float> viewport-offset-x: 0.0;
+    in-out property <float> viewport-offset-y: 0.0;
 
     callback tool-selected(ViewerTool);
     callback series-selected(string);
-    callback viewport-mouse-down(float, float);
-    callback viewport-mouse-move(float, float);
-    callback viewport-mouse-up(float, float);
+    callback viewport-mouse-down(float, float, float, float);
+    callback viewport-mouse-move(float, float, float, float);
+    callback viewport-mouse-up(float, float, float, float);
     callback viewport-scroll(float);
     callback measurement-clicked(string);
     callback reset-view();
@@ -232,10 +246,15 @@ export component StudyViewerWindow inherits Window {
                     viewport-touch := TouchArea {
                         clicked => { viewer-focus.focus(); }
                         pointer-event(event) => {
-                            // Forward to Rust via callbacks
+                            if (event.kind == PointerEventKind.down) {
+                                viewer-focus.focus();
+                                root.viewport-mouse-down(self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px);
+                            } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                                root.viewport-mouse-up(self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px);
+                            }
                         }
                         moved => {
-                            root.viewport-mouse-move(self.mouse-x / 1px, self.mouse-y / 1px);
+                            root.viewport-mouse-move(self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px);
                         }
                         scroll-event(event) => {
                             root.viewport-scroll(event.delta-y / 1px);
@@ -244,10 +263,32 @@ export component StudyViewerWindow inherits Window {
                     }
 
                     Image {
-                        width: parent.width;
-                        height: parent.height;
+                        x: (parent.width - self.width) / 2 + root.viewport-offset-x * 1px;
+                        y: (parent.height - self.height) / 2 + root.viewport-offset-y * 1px;
+                        width: parent.width * root.viewport-scale;
+                        height: parent.height * root.viewport-scale;
                         source: root.viewport-image;
                         image-fit: contain;
+                    }
+
+                    for overlay[idx] in measurement-overlays: Path {
+                        x: 0px;
+                        y: 0px;
+                        width: parent.width;
+                        height: parent.height;
+                        commands: overlay.commands;
+                        fill: transparent;
+                        stroke: overlay.selected ? Theme.accent-hover : (overlay.draft ? #D9A03CAA : Theme.accent-gold);
+                        stroke-width: overlay.draft ? 1px : 2px;
+                        stroke-line-cap: round;
+                    }
+
+                    for overlay[idx] in measurement-overlays: Text {
+                        x: overlay.label-x * 1px;
+                        y: overlay.label-y * 1px;
+                        text: overlay.label;
+                        color: overlay.selected ? Theme.accent-hover : Theme.accent-gold;
+                        font-size: Theme.font-xs;
                     }
 
                     Text {

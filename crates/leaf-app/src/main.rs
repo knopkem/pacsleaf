@@ -5,40 +5,82 @@
 
 use anyhow::Result;
 use directories::UserDirs;
+use glam::DVec2;
 use image::load_from_memory;
 use leaf_core::config::{data_dir, PacsNodeConfig, PacsProtocol};
 use leaf_core::domain::{InstanceInfo, SeriesInfo, StudyInfo, StudyUid};
 use leaf_core::error::{LeafError, LeafResult};
 use leaf_dicom::metadata::{import_dicom_file, read_instance_geometry};
-use leaf_dicom::pixel::{decode_frame, frame_count};
+use leaf_dicom::pixel::{decode_frame_with_window, frame_count};
 use leaf_db::imagebox::Imagebox;
 use leaf_net::dicomweb::DicomWebClient;
+use leaf_tools::measurement::{Measurement, MeasurementKind, MeasurementValue};
 use rfd::FileDialog;
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use serde::{Deserialize, Serialize};
+use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use serde::{Deserialize, Serialize};
 
 struct ViewerSession {
     viewer: slint::Weak<leaf_ui::StudyViewerWindow>,
     series: Vec<SeriesInfo>,
     instances_by_series: std::collections::HashMap<String, Vec<InstanceInfo>>,
     frames_by_series: HashMap<String, Vec<FrameRef>>,
-    measurements_by_series: HashMap<String, Vec<leaf_ui::MeasurementEntry>>,
+    measurements_by_series: HashMap<String, Vec<Measurement>>,
     active_series_uid: String,
     active_frame_index: usize,
     measurement_panel_visible: bool,
+    active_tool: leaf_ui::ViewerTool,
+    viewport_scale: f32,
+    viewport_offset_x: f32,
+    viewport_offset_y: f32,
+    window_center: Option<f64>,
+    window_width: Option<f64>,
+    default_window_center: Option<f64>,
+    default_window_width: Option<f64>,
+    viewport_width: f32,
+    viewport_height: f32,
+    active_frame_width: u32,
+    active_frame_height: u32,
+    selected_measurement_id: Option<String>,
+    draft_measurement: Option<DraftMeasurement>,
+    drag_state: Option<ViewportDragState>,
 }
 
 #[derive(Clone)]
 struct FrameRef {
     file_path: String,
     frame_index: u32,
+}
+
+#[derive(Clone, Copy)]
+struct ViewportDragState {
+    origin_x: f32,
+    origin_y: f32,
+    start_offset_x: f32,
+    start_offset_y: f32,
+    start_scale: f32,
+    start_window_center: f64,
+    start_window_width: f64,
+}
+
+#[derive(Clone)]
+struct DraftMeasurement {
+    start: DVec2,
+    end: DVec2,
+}
+
+#[derive(Clone, Copy)]
+struct ViewportGeometry {
+    image_origin_x: f32,
+    image_origin_y: f32,
+    image_width: f32,
+    image_height: f32,
 }
 
 struct RemoteStudyRef {
@@ -954,6 +996,8 @@ fn open_viewer_for_study(imagebox: &Imagebox, study_uid: &str) -> LeafResult<lea
     let viewer = leaf_ui::StudyViewerWindow::new()
         .map_err(|error| LeafError::Render(error.to_string()))?;
     viewer.set_patient_name(study.patient.patient_name.clone().into());
+    viewer.set_connection_status("Local imagebox".into());
+    viewer.set_active_tool(leaf_ui::ViewerTool::WindowLevel);
     viewer.set_study_description(
         study
             .study_description
@@ -962,7 +1006,6 @@ fn open_viewer_for_study(imagebox: &Imagebox, study_uid: &str) -> LeafResult<lea
             .into(),
     );
     viewer.set_measurement_panel_visible(false);
-    install_viewer_tool_state(&viewer);
 
     let active_series_uid = series
         .first()
@@ -974,31 +1017,70 @@ fn open_viewer_for_study(imagebox: &Imagebox, study_uid: &str) -> LeafResult<lea
         instances_by_series,
         frames_by_series,
         measurements_by_series,
-            active_series_uid,
-            active_frame_index: 0,
-            measurement_panel_visible: false,
-        }));
+        active_series_uid,
+        active_frame_index: 0,
+        measurement_panel_visible: false,
+        active_tool: leaf_ui::ViewerTool::WindowLevel,
+        viewport_scale: 1.0,
+        viewport_offset_x: 0.0,
+        viewport_offset_y: 0.0,
+        window_center: None,
+        window_width: None,
+        default_window_center: None,
+        default_window_width: None,
+        viewport_width: 0.0,
+        viewport_height: 0.0,
+        active_frame_width: 0,
+        active_frame_height: 0,
+        selected_measurement_id: None,
+        draft_measurement: None,
+        drag_state: None,
+    }));
 
-    update_series_model(&session.borrow())?;
-    update_viewer_image(&session.borrow())?;
-    update_measurements_model(&session.borrow())?;
+    {
+        let session_ref = session.borrow();
+        update_series_model(&session_ref)?;
+    }
+    {
+        let mut session_ref = session.borrow_mut();
+        update_viewer_image(&mut session_ref)?;
+    }
+    {
+        let session_ref = session.borrow();
+        update_measurements_model(&session_ref)?;
+    }
 
     let session_for_series = session.clone();
     viewer.on_series_selected(move |series_uid| {
         let mut session = session_for_series.borrow_mut();
         session.active_series_uid = series_uid.to_string();
         session.active_frame_index = 0;
-        if let Err(error) = update_series_model(&session)
-            .and_then(|_| update_viewer_image(&session))
-            .and_then(|_| update_measurements_model(&session))
-        {
+        session.selected_measurement_id = None;
+        session.draft_measurement = None;
+        reset_viewport_state(&mut session, true);
+        let result = update_series_model(&session)
+            .and_then(|_| update_viewer_image(&mut session))
+            .and_then(|_| update_measurements_model(&session));
+        if let Err(error) = result {
             info!("Failed to switch series: {}", error);
+        }
+    });
+
+    let session_for_tool = session.clone();
+    viewer.on_tool_selected(move |tool| {
+        let mut session = session_for_tool.borrow_mut();
+        session.active_tool = tool;
+        session.drag_state = None;
+        session.draft_measurement = None;
+        if let Err(error) = apply_viewport_state(&session) {
+            info!("Failed to switch tool: {}", error);
         }
     });
 
     let session_for_scroll = session.clone();
     viewer.on_viewport_scroll(move |delta| {
         let mut session = session_for_scroll.borrow_mut();
+        session.draft_measurement = None;
         let step = if delta < 0.0 {
             1
         } else if delta > 0.0 {
@@ -1013,8 +1095,113 @@ fn open_viewer_for_study(imagebox: &Imagebox, study_uid: &str) -> LeafResult<lea
             .unwrap_or(0);
         session.active_frame_index =
             (session.active_frame_index as i32 + step).clamp(0, max_index as i32) as usize;
-        if let Err(error) = update_viewer_image(&session) {
+        if let Err(error) = update_viewer_image(&mut session) {
             info!("Failed to scroll viewport: {}", error);
+        }
+    });
+
+    let session_for_mouse_down = session.clone();
+    viewer.on_viewport_mouse_down(move |x, y, viewport_width, viewport_height| {
+        let mut session = session_for_mouse_down.borrow_mut();
+        update_viewport_dimensions(&mut session, viewport_width, viewport_height);
+        match session.active_tool {
+            leaf_ui::ViewerTool::WindowLevel | leaf_ui::ViewerTool::Pan | leaf_ui::ViewerTool::Zoom => {
+                session.drag_state = Some(ViewportDragState {
+                    origin_x: x,
+                    origin_y: y,
+                    start_offset_x: session.viewport_offset_x,
+                    start_offset_y: session.viewport_offset_y,
+                    start_scale: session.viewport_scale,
+                    start_window_center: session.window_center.unwrap_or(0.0),
+                    start_window_width: session.window_width.unwrap_or(1.0),
+                });
+            }
+            leaf_ui::ViewerTool::Line => {
+                session.drag_state = None;
+                session.draft_measurement =
+                    viewport_to_image_point(&session, x, y, false).map(|start| DraftMeasurement {
+                        start,
+                        end: start,
+                    });
+                if let Err(error) = update_measurement_overlays(&session) {
+                    info!("Failed to begin line measurement: {}", error);
+                }
+            }
+            _ => {
+                session.drag_state = None;
+                session.draft_measurement = None;
+            }
+        }
+    });
+
+    let session_for_mouse_up = session.clone();
+    viewer.on_viewport_mouse_up(move |x, y, viewport_width, viewport_height| {
+        let mut session = session_for_mouse_up.borrow_mut();
+        update_viewport_dimensions(&mut session, viewport_width, viewport_height);
+
+        if matches!(session.active_tool, leaf_ui::ViewerTool::Line) {
+            if let Some(end) = viewport_to_image_point(&session, x, y, true) {
+                if let Some(draft) = session.draft_measurement.as_mut() {
+                    draft.end = end;
+                }
+            }
+
+            if let Err(error) = finalize_line_measurement(&mut session) {
+                info!("Failed to finalize line measurement: {}", error);
+            }
+        } else {
+            session.drag_state = None;
+        }
+    });
+
+    let session_for_mouse_move = session.clone();
+    viewer.on_viewport_mouse_move(move |x, y, viewport_width, viewport_height| {
+        let mut session = session_for_mouse_move.borrow_mut();
+        update_viewport_dimensions(&mut session, viewport_width, viewport_height);
+
+        if matches!(session.active_tool, leaf_ui::ViewerTool::Line) {
+            if let Some(end) = viewport_to_image_point(&session, x, y, true) {
+                if let Some(draft) = session.draft_measurement.as_mut() {
+                    draft.end = end;
+                }
+            }
+
+            if let Err(error) = update_measurement_overlays(&session) {
+                info!("Failed to update line measurement preview: {}", error);
+            }
+            return;
+        }
+
+        let Some(drag_state) = session.drag_state else {
+            return;
+        };
+
+        let dx = x - drag_state.origin_x;
+        let dy = y - drag_state.origin_y;
+
+        let result = match session.active_tool {
+            leaf_ui::ViewerTool::Pan => {
+                session.viewport_offset_x = drag_state.start_offset_x + dx;
+                session.viewport_offset_y = drag_state.start_offset_y + dy;
+                apply_viewport_state(&session)
+            }
+            leaf_ui::ViewerTool::Zoom => {
+                let factor = (1.0 - dy * 0.01).max(0.1);
+                session.viewport_scale = (drag_state.start_scale * factor).clamp(0.25, 8.0);
+                apply_viewport_state(&session)
+            }
+            leaf_ui::ViewerTool::WindowLevel => {
+                let sensitivity = (drag_state.start_window_width / 512.0).max(1.0);
+                session.window_center = Some(drag_state.start_window_center + dx as f64 * sensitivity);
+                session.window_width =
+                    Some((drag_state.start_window_width - dy as f64 * sensitivity).max(1.0));
+                update_viewer_image(&mut session)
+            }
+            _ => Ok(()),
+        };
+
+        if let Err(error) = result {
+            info!("Failed to update viewport interaction: {}", error);
         }
     });
 
@@ -1022,7 +1209,10 @@ fn open_viewer_for_study(imagebox: &Imagebox, study_uid: &str) -> LeafResult<lea
     viewer.on_reset_view(move || {
         let mut session = session_for_reset.borrow_mut();
         session.active_frame_index = 0;
-        if let Err(error) = update_viewer_image(&session) {
+        session.selected_measurement_id = None;
+        session.draft_measurement = None;
+        reset_viewport_state(&mut session, false);
+        if let Err(error) = update_viewer_image(&mut session) {
             info!("Failed to reset view: {}", error);
         }
     });
@@ -1033,6 +1223,49 @@ fn open_viewer_for_study(imagebox: &Imagebox, study_uid: &str) -> LeafResult<lea
         session.measurement_panel_visible = !session.measurement_panel_visible;
         if let Some(viewer) = session.viewer.upgrade() {
             viewer.set_measurement_panel_visible(session.measurement_panel_visible);
+        }
+    });
+
+    let session_for_measurement_click = session.clone();
+    viewer.on_measurement_clicked(move |measurement_id| {
+        let mut session = session_for_measurement_click.borrow_mut();
+        session.selected_measurement_id = Some(measurement_id.to_string());
+
+        let selected = session
+            .measurements_by_series
+            .get(&session.active_series_uid)
+            .and_then(|measurements| {
+                measurements
+                    .iter()
+                    .find(|measurement| measurement.id == measurement_id.as_str())
+            })
+            .cloned();
+
+        let Some(selected) = selected else {
+            if let Err(error) = update_measurement_overlays(&session) {
+                info!("Failed to update measurement selection: {}", error);
+            }
+            return;
+        };
+
+        let max_index = session
+            .frames_by_series
+            .get(&session.active_series_uid)
+            .map(|frames| frames.len().saturating_sub(1))
+            .unwrap_or(0);
+        session.active_frame_index = selected.slice_index.min(max_index);
+        let value_text = measurement_value_text(&selected, active_pixel_spacing(&session));
+
+        let result = update_viewer_image(&mut session).and_then(|_| update_measurements_model(&session));
+        if let Err(error) = result {
+            info!("Failed to select measurement: {}", error);
+            return;
+        }
+
+        if let Some(viewer) = session.viewer.upgrade() {
+            viewer.set_connection_status(
+                format!("Selected {} {}", measurement_kind_label(&selected), value_text).into(),
+            );
         }
     });
 
@@ -1076,13 +1309,293 @@ fn update_measurements_model(session: &ViewerSession) -> LeafResult<()> {
         .viewer
         .upgrade()
         .ok_or_else(|| LeafError::Render("Viewer window no longer available".into()))?;
+    let pixel_spacing = active_pixel_spacing(session);
     let entries = session
         .measurements_by_series
         .get(&session.active_series_uid)
-        .cloned()
+        .map(|measurements| {
+            measurements
+                .iter()
+                .map(|measurement| measurement_entry(measurement, pixel_spacing))
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     viewer.set_measurements(ModelRc::from(Rc::new(VecModel::from(entries))));
     Ok(())
+}
+
+fn update_viewport_dimensions(session: &mut ViewerSession, viewport_width: f32, viewport_height: f32) {
+    if viewport_width > 0.0 {
+        session.viewport_width = viewport_width;
+    }
+    if viewport_height > 0.0 {
+        session.viewport_height = viewport_height;
+    }
+}
+
+fn measurement_entry(
+    measurement: &Measurement,
+    pixel_spacing: (f64, f64),
+) -> leaf_ui::MeasurementEntry {
+    leaf_ui::MeasurementEntry {
+        id: measurement.id.clone().into(),
+        kind: measurement_kind_label(measurement).into(),
+        value: measurement_value_text(measurement, pixel_spacing).into(),
+        label: measurement.label.clone().unwrap_or_default().into(),
+        slice_index: (measurement.slice_index + 1) as i32,
+    }
+}
+
+fn measurement_kind_label(measurement: &Measurement) -> &'static str {
+    match &measurement.kind {
+        MeasurementKind::Line { .. } => "Line",
+        MeasurementKind::Angle { .. } => "Angle",
+        MeasurementKind::RectangleRoi { .. } => "ROI",
+        MeasurementKind::EllipseRoi { .. } => "Ellipse ROI",
+        MeasurementKind::PolygonRoi { .. } => "Polygon ROI",
+        MeasurementKind::PixelProbe { .. } => "Probe",
+    }
+}
+
+fn measurement_value_text(measurement: &Measurement, pixel_spacing: (f64, f64)) -> String {
+    match measurement.compute(pixel_spacing).value {
+        MeasurementValue::Distance { mm } => format_distance_mm(mm),
+        MeasurementValue::Angle { degrees } => format!("{degrees:.1}\u{b0}"),
+        MeasurementValue::RoiStats { area_mm2, .. } => format!("{area_mm2:.1} mm\u{b2}"),
+        MeasurementValue::PixelValue { value, unit } => format!("{value:.0} {unit}"),
+    }
+}
+
+fn format_distance_mm(mm: f64) -> String {
+    if mm >= 100.0 {
+        format!("{mm:.0} mm")
+    } else if mm >= 10.0 {
+        format!("{mm:.1} mm")
+    } else {
+        format!("{mm:.2} mm")
+    }
+}
+
+fn active_pixel_spacing(session: &ViewerSession) -> (f64, f64) {
+    session
+        .series
+        .iter()
+        .find(|series| series.series_uid.0 == session.active_series_uid)
+        .and_then(|series| series.pixel_spacing)
+        .unwrap_or((1.0, 1.0))
+}
+
+fn update_measurement_overlays(session: &ViewerSession) -> LeafResult<()> {
+    let viewer = session
+        .viewer
+        .upgrade()
+        .ok_or_else(|| LeafError::Render("Viewer window no longer available".into()))?;
+    let pixel_spacing = active_pixel_spacing(session);
+
+    let mut overlays = session
+        .measurements_by_series
+        .get(&session.active_series_uid)
+        .into_iter()
+        .flat_map(|measurements| measurements.iter())
+        .filter(|measurement| measurement.slice_index == session.active_frame_index)
+        .filter_map(|measurement| {
+            let label = measurement_value_text(measurement, pixel_spacing);
+            measurement_overlay(
+                session,
+                &measurement.id,
+                measurement_line_points(measurement)?,
+                label,
+                session.selected_measurement_id.as_deref() == Some(measurement.id.as_str()),
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(draft) = session.draft_measurement.as_ref() {
+        let draft_distance = line_distance_mm(draft.start, draft.end, pixel_spacing);
+        if let Some(overlay) = measurement_overlay(
+            session,
+            "draft-line",
+            (draft.start, draft.end),
+            format_distance_mm(draft_distance),
+            false,
+            true,
+        ) {
+            overlays.push(overlay);
+        }
+    }
+
+    viewer.set_measurement_overlays(ModelRc::from(Rc::new(VecModel::from(overlays))));
+    Ok(())
+}
+
+fn measurement_line_points(measurement: &Measurement) -> Option<(DVec2, DVec2)> {
+    match &measurement.kind {
+        MeasurementKind::Line { start, end } => Some((*start, *end)),
+        _ => None,
+    }
+}
+
+fn measurement_overlay(
+    session: &ViewerSession,
+    id: &str,
+    points: (DVec2, DVec2),
+    label: String,
+    selected: bool,
+    draft: bool,
+) -> Option<leaf_ui::MeasurementOverlay> {
+    let (start, end) = points;
+    let (start_x, start_y) = image_to_viewport_point(session, start)?;
+    let (end_x, end_y) = image_to_viewport_point(session, end)?;
+    let dx = end_x - start_x;
+    let dy = end_y - start_y;
+    if (dx * dx + dy * dy).sqrt() < 1.0 {
+        return None;
+    }
+
+    Some(leaf_ui::MeasurementOverlay {
+        id: id.into(),
+        commands: format!("M {start_x:.2} {start_y:.2} L {end_x:.2} {end_y:.2}").into(),
+        label_x: (end_x + 6.0).into(),
+        label_y: (end_y - 16.0).max(6.0).into(),
+        label: label.into(),
+        selected,
+        draft,
+    })
+}
+
+fn finalize_line_measurement(session: &mut ViewerSession) -> LeafResult<()> {
+    session.drag_state = None;
+
+    let Some(draft) = session.draft_measurement.take() else {
+        return update_measurement_overlays(session);
+    };
+
+    if (draft.end - draft.start).length() < 2.0 {
+        return update_measurement_overlays(session);
+    }
+
+    let measurement = Measurement::line(
+        &session.active_series_uid,
+        session.active_frame_index,
+        draft.start,
+        draft.end,
+    );
+    let value_text = measurement_value_text(&measurement, active_pixel_spacing(session));
+    let active_series_uid = session.active_series_uid.clone();
+    session.selected_measurement_id = Some(measurement.id.clone());
+    session
+        .measurements_by_series
+        .entry(active_series_uid)
+        .or_default()
+        .push(measurement.clone());
+
+    if !session.measurement_panel_visible {
+        session.measurement_panel_visible = true;
+        if let Some(viewer) = session.viewer.upgrade() {
+            viewer.set_measurement_panel_visible(true);
+        }
+    }
+
+    update_measurements_model(session)?;
+    update_measurement_overlays(session)?;
+
+    if let Some(viewer) = session.viewer.upgrade() {
+        viewer.set_connection_status(format!("Created line {}", value_text).into());
+    }
+
+    Ok(())
+}
+
+fn image_to_viewport_point(session: &ViewerSession, point: DVec2) -> Option<(f32, f32)> {
+    let geometry = current_viewport_geometry(session)?;
+    let frame_width = session.active_frame_width as f32;
+    let frame_height = session.active_frame_height as f32;
+    if frame_width <= 0.0 || frame_height <= 0.0 {
+        return None;
+    }
+
+    Some((
+        geometry.image_origin_x + (point.x as f32 / frame_width) * geometry.image_width,
+        geometry.image_origin_y + (point.y as f32 / frame_height) * geometry.image_height,
+    ))
+}
+
+fn viewport_to_image_point(
+    session: &ViewerSession,
+    x: f32,
+    y: f32,
+    clamp: bool,
+) -> Option<DVec2> {
+    let geometry = current_viewport_geometry(session)?;
+    let frame_width = session.active_frame_width as f32;
+    let frame_height = session.active_frame_height as f32;
+    if frame_width <= 0.0 || frame_height <= 0.0 {
+        return None;
+    }
+
+    let mut normalized_x = (x - geometry.image_origin_x) / geometry.image_width;
+    let mut normalized_y = (y - geometry.image_origin_y) / geometry.image_height;
+
+    if clamp {
+        normalized_x = normalized_x.clamp(0.0, 1.0);
+        normalized_y = normalized_y.clamp(0.0, 1.0);
+    } else if !(0.0..=1.0).contains(&normalized_x) || !(0.0..=1.0).contains(&normalized_y) {
+        return None;
+    }
+
+    Some(DVec2::new(
+        normalized_x as f64 * frame_width as f64,
+        normalized_y as f64 * frame_height as f64,
+    ))
+}
+
+fn current_viewport_geometry(session: &ViewerSession) -> Option<ViewportGeometry> {
+    displayed_image_geometry(
+        session.viewport_width,
+        session.viewport_height,
+        session.active_frame_width,
+        session.active_frame_height,
+        session.viewport_scale,
+        session.viewport_offset_x,
+        session.viewport_offset_y,
+    )
+}
+
+fn displayed_image_geometry(
+    viewport_width: f32,
+    viewport_height: f32,
+    frame_width: u32,
+    frame_height: u32,
+    viewport_scale: f32,
+    viewport_offset_x: f32,
+    viewport_offset_y: f32,
+) -> Option<ViewportGeometry> {
+    if viewport_width <= 0.0 || viewport_height <= 0.0 || frame_width == 0 || frame_height == 0 {
+        return None;
+    }
+
+    let scaled_width = viewport_width * viewport_scale.max(0.1);
+    let scaled_height = viewport_height * viewport_scale.max(0.1);
+    let fit = (scaled_width / frame_width as f32).min(scaled_height / frame_height as f32);
+    if !fit.is_finite() || fit <= 0.0 {
+        return None;
+    }
+
+    let image_width = frame_width as f32 * fit;
+    let image_height = frame_height as f32 * fit;
+    Some(ViewportGeometry {
+        image_origin_x: (viewport_width - image_width) / 2.0 + viewport_offset_x,
+        image_origin_y: (viewport_height - image_height) / 2.0 + viewport_offset_y,
+        image_width,
+        image_height,
+    })
+}
+
+fn line_distance_mm(start: DVec2, end: DVec2, pixel_spacing: (f64, f64)) -> f64 {
+    let dx = (end.x - start.x) * pixel_spacing.1;
+    let dy = (end.y - start.y) * pixel_spacing.0;
+    (dx * dx + dy * dy).sqrt()
 }
 
 fn install_viewer_tool_state(viewer: &leaf_ui::StudyViewerWindow) {
@@ -1094,7 +1607,7 @@ fn install_viewer_tool_state(viewer: &leaf_ui::StudyViewerWindow) {
     });
 }
 
-fn update_viewer_image(session: &ViewerSession) -> LeafResult<()> {
+fn update_viewer_image(session: &mut ViewerSession) -> LeafResult<()> {
     let frames = session
         .frames_by_series
         .get(&session.active_series_uid)
@@ -1103,7 +1616,22 @@ fn update_viewer_image(session: &ViewerSession) -> LeafResult<()> {
     let frame_ref = frames
         .get(session.active_frame_index)
         .ok_or_else(|| LeafError::NoData("Frame index out of range".into()))?;
-    let frame = decode_frame(Path::new(&frame_ref.file_path), frame_ref.frame_index)?;
+    let frame = decode_frame_with_window(
+        Path::new(&frame_ref.file_path),
+        frame_ref.frame_index,
+        session.window_center.zip(session.window_width),
+    )?;
+
+    if session.default_window_center.is_none() || session.default_window_width.is_none() {
+        session.default_window_center = Some(frame.window_center);
+        session.default_window_width = Some(frame.window_width);
+    }
+    if session.window_center.is_none() || session.window_width.is_none() {
+        session.window_center = Some(frame.window_center);
+        session.window_width = Some(frame.window_width);
+    }
+    session.active_frame_width = frame.width;
+    session.active_frame_height = frame.height;
     let rgba = to_rgba(&frame)?;
 
     let viewer = session
@@ -1114,9 +1642,8 @@ fn update_viewer_image(session: &ViewerSession) -> LeafResult<()> {
         leaf_ui::image_from_rgba8(frame.width, frame.height, rgba)
             .map_err(|error| LeafError::Render(error.to_string()))?,
     );
-    viewer.set_window_info(format!("W:{:.0} L:{:.0}", frame.window_width, frame.window_center).into());
     viewer.set_slice_info(format!("{}/{}", session.active_frame_index + 1, total).into());
-    viewer.set_zoom_info("Fit".into());
+    apply_viewport_state(session)?;
     Ok(())
 }
 
@@ -1142,6 +1669,44 @@ fn build_frames_by_series(
             (series_uid.clone(), frames)
         })
         .collect()
+}
+
+fn apply_viewport_state(session: &ViewerSession) -> LeafResult<()> {
+    let viewer = session
+        .viewer
+        .upgrade()
+        .ok_or_else(|| LeafError::Render("Viewer window no longer available".into()))?;
+
+    viewer.set_active_tool(session.active_tool);
+    viewer.set_viewport_scale(session.viewport_scale);
+    viewer.set_viewport_offset_x(session.viewport_offset_x);
+    viewer.set_viewport_offset_y(session.viewport_offset_y);
+    viewer.set_zoom_info(format!("{:.0}%", session.viewport_scale * 100.0).into());
+
+    if let (Some(center), Some(width)) = (session.window_center, session.window_width) {
+        viewer.set_window_info(format!("W:{width:.0} L:{center:.0}").into());
+    }
+
+    update_measurement_overlays(session)?;
+
+    Ok(())
+}
+
+fn reset_viewport_state(session: &mut ViewerSession, clear_defaults: bool) {
+    session.viewport_scale = 1.0;
+    session.viewport_offset_x = 0.0;
+    session.viewport_offset_y = 0.0;
+    session.drag_state = None;
+
+    if clear_defaults {
+        session.window_center = None;
+        session.window_width = None;
+        session.default_window_center = None;
+        session.default_window_width = None;
+    } else {
+        session.window_center = session.default_window_center;
+        session.window_width = session.default_window_width;
+    }
 }
 
 fn sort_instances_for_stack(instances: &mut [InstanceInfo]) {
@@ -1274,6 +1839,7 @@ fn slice_distance(reference_ipp: [f64; 3], image_ipp: [f64; 3], scan_axis_normal
 mod tests {
     use super::*;
     use leaf_core::domain::{SeriesUid, SopInstanceUid, StudyUid};
+    use leaf_tools::measurement::Measurement;
 
     fn instance(
         sop_uid: &str,
@@ -1327,6 +1893,34 @@ mod tests {
             .map(|instance| instance.instance_number.unwrap())
             .collect::<Vec<_>>();
         assert_eq!(ordered_numbers, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn maps_viewport_points_into_image_space_with_contain_fit() {
+        let geometry =
+            displayed_image_geometry(800.0, 600.0, 512, 256, 1.0, 0.0, 0.0).unwrap();
+        assert!((geometry.image_origin_y - 100.0).abs() < 0.001);
+        assert!((geometry.image_width - 800.0).abs() < 0.001);
+        assert!((geometry.image_height - 400.0).abs() < 0.001);
+
+        let normalized_x = (400.0 - geometry.image_origin_x) / geometry.image_width;
+        let normalized_y = (300.0 - geometry.image_origin_y) / geometry.image_height;
+        let image_point = DVec2::new(normalized_x as f64 * 512.0, normalized_y as f64 * 256.0);
+
+        assert!((image_point.x - 256.0).abs() < 0.001);
+        assert!((image_point.y - 128.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn formats_line_measurement_values_in_millimeters() {
+        let measurement = Measurement::line(
+            "series",
+            0,
+            DVec2::new(0.0, 0.0),
+            DVec2::new(3.0, 4.0),
+        );
+
+        assert_eq!(measurement_value_text(&measurement, (1.0, 1.0)), "5.00 mm");
     }
 }
 

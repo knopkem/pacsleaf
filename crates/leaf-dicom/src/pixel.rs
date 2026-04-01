@@ -19,9 +19,26 @@ pub struct DecodedFrame {
 
 /// Decode a single frame from a DICOM file.
 pub fn decode_frame(path: &Path, frame_index: u32) -> LeafResult<DecodedFrame> {
+    decode_frame_with_window(path, frame_index, None)
+}
+
+/// Decode a single frame with an optional window/level override.
+pub fn decode_frame_with_window(
+    path: &Path,
+    frame_index: u32,
+    window_override: Option<(f64, f64)>,
+) -> LeafResult<DecodedFrame> {
     let file = FileFormat::open(path).map_err(|e| LeafError::DicomParse(e.to_string()))?;
-    let image =
+    let mut image =
         DicomImage::from_dataset(&file.dataset).map_err(|e| LeafError::DicomParse(e.to_string()))?;
+
+    if let Some((center, width)) = window_override {
+        image
+            .set_window(center, width)
+            .map_err(|e| LeafError::DicomParse(e.to_string()))?;
+    } else if image.window_center.is_none() || image.window_width.is_none() {
+        image.auto_window();
+    }
 
     let pixels = image
         .frame_u8(frame_index)
