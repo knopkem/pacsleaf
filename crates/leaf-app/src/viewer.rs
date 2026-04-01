@@ -68,6 +68,7 @@ struct ViewportDragState {
 struct VolumeDragState {
     origin_x: f32,
     origin_y: f32,
+    button: i32, // 0 = left, 2 = right
     start_view_state: VolumeViewState,
 }
 
@@ -196,12 +197,20 @@ pub(crate) fn open_viewer_for_study(
     let session_for_tool = session.clone();
     viewer.on_tool_selected(move |tool| {
         let mut session = session_for_tool.borrow_mut();
+        let had_draft = session.draft_measurement.is_some();
         session.active_tool = tool;
         session.drag_state = None;
         session.volume_drag_state = None;
         session.draft_measurement = None;
-        if let Err(error) = apply_viewport_state(&session) {
-            info!("Failed to switch tool: {}", error);
+        // Only rebuild measurement overlays when a draft measurement was cleared;
+        // otherwise the overlays haven't changed and the Slint model rebuild is
+        // pure overhead.
+        if had_draft {
+            if let Err(error) = apply_viewport_state(&session) {
+                info!("Failed to switch tool: {}", error);
+            }
+        } else if let Some(viewer) = session.viewer.upgrade() {
+            viewer.set_active_tool(session.active_tool);
         }
     });
 
@@ -243,7 +252,7 @@ pub(crate) fn open_viewer_for_study(
     });
 
     let session_for_mouse_down = session.clone();
-    viewer.on_viewport_mouse_down(move |x, y, viewport_width, viewport_height| {
+    viewer.on_viewport_mouse_down(move |x, y, viewport_width, viewport_height, button| {
         let mut session = session_for_mouse_down.borrow_mut();
         update_viewport_dimensions(&mut session, viewport_width, viewport_height);
         if session.volume_preview_active {
@@ -251,6 +260,7 @@ pub(crate) fn open_viewer_for_study(
             session.volume_drag_state = Some(VolumeDragState {
                 origin_x: x,
                 origin_y: y,
+                button,
                 start_view_state: *active_volume_view_state(&mut session),
             });
             return;
@@ -290,6 +300,9 @@ pub(crate) fn open_viewer_for_study(
         update_viewport_dimensions(&mut session, viewport_width, viewport_height);
         if session.volume_preview_active {
             session.volume_drag_state = None;
+            if let Err(error) = render_volume_preview(&mut session, false) {
+                info!("Failed to finalize volume preview interaction: {}", error);
+            }
             return;
         }
 
@@ -318,8 +331,8 @@ pub(crate) fn open_viewer_for_study(
             };
             let dx = x - drag_state.origin_x;
             let dy = y - drag_state.origin_y;
-            apply_volume_drag(&mut session, drag_state.start_view_state, dx, dy);
-            if let Err(error) = render_or_show_volume_preview(&mut session) {
+            apply_volume_drag(&mut session, drag_state.start_view_state, dx, dy, drag_state.button);
+            if let Err(error) = render_volume_preview(&mut session, true) {
                 info!("Failed to update volume preview interaction: {}", error);
             }
             return;
@@ -538,17 +551,46 @@ fn apply_volume_drag(
     start_view_state: VolumeViewState,
     delta_x: f32,
     delta_y: f32,
+    button: i32,
 ) {
     let active_tool = session.active_tool;
+    let scalar_range = session
+        .prepared_volumes_by_series
+        .get(&session.active_series_uid)
+        .map(|prepared| prepared.scalar_range());
     let view_state = active_volume_view_state(session);
     *view_state = start_view_state;
+    if let Some((scalar_min, scalar_max)) = scalar_range {
+        view_state.ensure_transfer_window(scalar_min, scalar_max);
+    }
+
+    // Right-click always orbits, regardless of active tool.
+    if button == 2 {
+        view_state.orbit(delta_x as f64 * 0.6, -delta_y as f64 * 0.6);
+        return;
+    }
+
     match active_tool {
-        leaf_ui::ViewerTool::Pan => view_state.pan(delta_x as f64, delta_y as f64),
+        leaf_ui::ViewerTool::WindowLevel => {
+            if let Some((scalar_min, scalar_max)) = scalar_range {
+                let (start_center, start_width) =
+                    start_view_state.transfer_window(scalar_min, scalar_max);
+                let range = (scalar_max - scalar_min).max(1.0);
+                let sensitivity = (range / 450.0).max(1.0);
+                view_state.set_transfer_window(
+                    start_center + delta_y as f64 * sensitivity,
+                    start_width + delta_x as f64 * sensitivity,
+                    scalar_min,
+                    scalar_max,
+                );
+            }
+        }
+        leaf_ui::ViewerTool::Pan => view_state.pan(-delta_x as f64, -delta_y as f64),
         leaf_ui::ViewerTool::Zoom => {
-            let factor = (1.0 - delta_y as f64 * 0.01).clamp(0.25, 4.0);
+            let factor = (1.0 - delta_y as f64 * 0.004).clamp(0.1, 10.0);
             view_state.zoom_by(factor);
         }
-        _ => view_state.orbit(delta_x as f64 * 0.45, delta_y as f64 * 0.35),
+        _ => view_state.orbit(delta_x as f64 * 0.6, -delta_y as f64 * 0.6),
     }
 }
 
@@ -927,6 +969,17 @@ fn apply_viewport_state(session: &ViewerSession) -> LeafResult<()> {
     viewer.set_volume_preview_active(session.volume_preview_active);
 
     if session.volume_preview_active {
+        if let Some(prepared) = session.prepared_volumes_by_series.get(&session.active_series_uid) {
+            let (center, width) = session
+                .volume_view_state_by_series
+                .get(&session.active_series_uid)
+                .copied()
+                .unwrap_or_default()
+                .transfer_window(prepared.scalar_range().0, prepared.scalar_range().1);
+            viewer.set_window_info(format!("3D C:{center:.0} W:{width:.0}").into());
+        } else {
+            viewer.set_window_info("DVR preview".into());
+        }
         let volume_zoom = session
             .volume_view_state_by_series
             .get(&session.active_series_uid)
@@ -935,7 +988,6 @@ fn apply_viewport_state(session: &ViewerSession) -> LeafResult<()> {
         viewer.set_viewport_scale(1.0);
         viewer.set_viewport_offset_x(0.0);
         viewer.set_viewport_offset_y(0.0);
-        viewer.set_window_info("DVR orbit".into());
         viewer.set_zoom_info(format!("3D {:.0}%", volume_zoom * 100.0).into());
         update_measurement_overlays(session)?;
         return Ok(());
@@ -956,6 +1008,10 @@ fn apply_viewport_state(session: &ViewerSession) -> LeafResult<()> {
 }
 
 fn render_or_show_volume_preview(session: &mut ViewerSession) -> LeafResult<()> {
+    render_volume_preview(session, false)
+}
+
+fn render_volume_preview(session: &mut ViewerSession, interactive: bool) -> LeafResult<()> {
     let series_uid = session.active_series_uid.clone();
     if !session.prepared_volumes_by_series.contains_key(&series_uid) {
         let file_paths = active_series_file_paths(session)?;
@@ -968,6 +1024,12 @@ fn render_or_show_volume_preview(session: &mut ViewerSession) -> LeafResult<()> 
             .insert(series_uid.clone(), prepared);
     }
     let preview_size = preview_dimensions(session);
+    let scalar_range = session
+        .prepared_volumes_by_series
+        .get(&series_uid)
+        .map(|prepared| prepared.scalar_range())
+        .ok_or_else(|| LeafError::Render("Prepared volume missing".into()))?;
+    active_volume_view_state(session).ensure_transfer_window(scalar_range.0, scalar_range.1);
     let view_state = session
         .volume_view_state_by_series
         .get(&series_uid)
@@ -988,7 +1050,13 @@ fn render_or_show_volume_preview(session: &mut ViewerSession) -> LeafResult<()> 
         let prepared = prepared_volumes_by_series
             .get(&series_uid)
             .ok_or_else(|| LeafError::Render("Prepared volume missing".into()))?;
-        renderer.render_prepared_preview(prepared, &view_state, preview_size.0, preview_size.1)?
+        renderer.render_prepared_preview(
+            prepared,
+            &view_state,
+            preview_size.0,
+            preview_size.1,
+            interactive,
+        )?
     };
     show_volume_preview(session, &preview)
 }
@@ -1038,9 +1106,10 @@ fn preview_dimensions(session: &ViewerSession) -> (u32, u32) {
     width = width.max(256);
     height = height.max(256);
 
+    let target_max_side = 640;
     let max_side = width.max(height);
-    if max_side > 768 {
-        let scale = 768.0 / max_side as f32;
+    if max_side > target_max_side {
+        let scale = target_max_side as f32 / max_side as f32;
         width = (width as f32 * scale).round().max(256.0) as u32;
         height = (height as f32 * scale).round().max(256.0) as u32;
     }
@@ -1053,6 +1122,8 @@ fn show_volume_preview(
     preview: &VolumePreviewImage,
 ) -> LeafResult<()> {
     session.volume_preview_active = true;
+    session.active_frame_width = preview.width;
+    session.active_frame_height = preview.height;
     let viewer = session
         .viewer
         .upgrade()
@@ -1322,6 +1393,44 @@ mod tests {
 
         assert!((image_point.x - 256.0).abs() < 0.001);
         assert!((image_point.y - 128.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn preview_dimensions_keep_output_size_stable() {
+        let session = ViewerSession {
+            viewer: slint::Weak::default(),
+            series: Vec::new(),
+            instances_by_series: HashMap::new(),
+            frames_by_series: HashMap::new(),
+            measurements_by_series: HashMap::new(),
+            active_series_uid: String::new(),
+            active_frame_index: 0,
+            measurement_panel_visible: false,
+            volume_preview_active: false,
+            active_tool: leaf_ui::ViewerTool::WindowLevel,
+            viewport_scale: 1.0,
+            viewport_offset_x: 0.0,
+            viewport_offset_y: 0.0,
+            window_center: None,
+            window_width: None,
+            default_window_center: None,
+            default_window_width: None,
+            viewport_width: 1400.0,
+            viewport_height: 900.0,
+            active_frame_width: 0,
+            active_frame_height: 0,
+            selected_measurement_id: None,
+            draft_measurement: None,
+            drag_state: None,
+            volume_drag_state: None,
+            volume_renderer: None,
+            prepared_volumes_by_series: HashMap::new(),
+            volume_view_state_by_series: HashMap::new(),
+        };
+
+        let preview = preview_dimensions(&session);
+
+        assert_eq!(preview.0.max(preview.1), 640);
     }
 
     #[test]

@@ -75,7 +75,7 @@ export component StudyViewerWindow inherits Window {
 
     callback tool-selected(ViewerTool);
     callback series-selected(string);
-    callback viewport-mouse-down(float, float, float, float);
+    callback viewport-mouse-down(/* x */ float, /* y */ float, /* w */ float, /* h */ float, /* button: 0=left,2=right */ int);
     callback viewport-mouse-move(float, float, float, float);
     callback viewport-mouse-up(float, float, float, float);
     callback viewport-scroll(float);
@@ -255,7 +255,11 @@ export component StudyViewerWindow inherits Window {
                         pointer-event(event) => {
                             if (event.kind == PointerEventKind.down) {
                                 viewer-focus.focus();
-                                root.viewport-mouse-down(self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px);
+                                if (event.button == PointerEventButton.right) {
+                                    root.viewport-mouse-down(self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px, 2);
+                                } else {
+                                    root.viewport-mouse-down(self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px, 0);
+                                }
                             } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
                                 root.viewport-mouse-up(self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px);
                             }

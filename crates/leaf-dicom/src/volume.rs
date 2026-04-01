@@ -2,6 +2,7 @@
 
 use dicom_toolkit_data::FileFormat;
 use dicom_toolkit_dict::{tags, Tag};
+use dicom_toolkit_image::{pixel, ModalityLut, PixelRepresentation};
 use glam::{DMat3, DVec3};
 use leaf_core::domain::SeriesUid;
 use leaf_core::error::{LeafError, LeafResult};
@@ -78,17 +79,8 @@ pub fn assemble_volume(file_paths: &[String], _series_uid: &SeriesUid) -> LeafRe
         let pixel_data = ds
             .get_bytes(tags::PIXEL_DATA)
             .ok_or_else(|| LeafError::VolumeAssembly("Missing pixel data".into()))?;
-
-        // Interpret as i16 (common for CT).
-        let slice_voxels: &[i16] = bytemuck::cast_slice(pixel_data);
-        if slice_voxels.len() < width * height {
-            return Err(LeafError::VolumeAssembly(format!(
-                "Slice has {} voxels, expected {}",
-                slice_voxels.len(),
-                width * height
-            )));
-        }
-        voxels.extend_from_slice(&slice_voxels[..width * height]);
+        let slice_voxels = decode_modality_voxels(ds, pixel_data, width * height)?;
+        voxels.extend_from_slice(&slice_voxels);
     }
 
     // Step 4: Extract geometric info.
@@ -257,6 +249,61 @@ fn projected_slice_spacing(entries: &[SliceEntry]) -> Option<f64> {
     let first = entries.first()?.image_position?;
     let second = entries.get(1)?.image_position?;
     Some(normal.dot(second - first).abs())
+}
+
+fn decode_modality_voxels(
+    ds: &dicom_toolkit_data::DataSet,
+    pixel_data: &[u8],
+    expected_len: usize,
+) -> LeafResult<Vec<i16>> {
+    let bits_allocated = ds.get_u16(tags::BITS_ALLOCATED).unwrap_or(16);
+    let bits_stored = ds.get_u16(tags::BITS_STORED).unwrap_or(bits_allocated);
+    let high_bit = ds.get_u16(tags::HIGH_BIT).unwrap_or(bits_stored.saturating_sub(1));
+    let pixel_representation = match ds.get_u16(tags::PIXEL_REPRESENTATION).unwrap_or(0) {
+        1 => PixelRepresentation::Signed,
+        _ => PixelRepresentation::Unsigned,
+    };
+    let modality_lut = ModalityLut::new(
+        ds.get_f64(tags::RESCALE_INTERCEPT).unwrap_or(0.0),
+        ds.get_f64(tags::RESCALE_SLOPE).unwrap_or(1.0),
+    );
+
+    let values = match (bits_allocated, pixel_representation) {
+        (8, _) => modality_lut.apply_to_frame_u8(pixel_data),
+        (16, PixelRepresentation::Unsigned) => {
+            let pixels = pixel::decode_u16_le(pixel_data);
+            let pixels = pixel::mask_u16(&pixels, bits_stored, high_bit);
+            modality_lut.apply_to_frame_u16(&pixels)
+        }
+        (16, PixelRepresentation::Signed) => {
+            let pixels = pixel::decode_i16_le(pixel_data);
+            let pixels = pixel::mask_i16(&pixels, bits_stored, high_bit);
+            modality_lut.apply_to_frame_i16(&pixels)
+        }
+        _ => {
+            return Err(LeafError::VolumeAssembly(format!(
+                "Unsupported BitsAllocated={bits_allocated} for volume assembly"
+            )))
+        }
+    };
+
+    if values.len() < expected_len {
+        return Err(LeafError::VolumeAssembly(format!(
+            "Slice has {} voxels, expected {}",
+            values.len(),
+            expected_len
+        )));
+    }
+
+    Ok(values
+        .into_iter()
+        .take(expected_len)
+        .map(quantize_modality_value)
+        .collect())
+}
+
+fn quantize_modality_value(value: f64) -> i16 {
+    value.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
 }
 
 #[cfg(test)]
