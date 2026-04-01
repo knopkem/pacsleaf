@@ -1,0 +1,18 @@
+[package]
+name = "leaf-db"
+description = "Local imagebox database for pacsleaf (redb-backed)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+leaf-core = { workspace = true }
+redb = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }

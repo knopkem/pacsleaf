@@ -1,0 +1,310 @@
+// pacsleaf Study Browser Window
+// Provides study search, list, and series preview for the local imagebox and remote PACS nodes.
+
+import { Theme } from "../theme/theme.slint";
+import { StatusBar } from "../components/status-bar.slint";
+
+// Model for a study row in the browser.
+export struct StudyEntry {
+    study-uid: string,
+    patient-name: string,
+    patient-id: string,
+    study-date: string,
+    modality: string,
+    description: string,
+    series-count: int,
+    instance-count: int,
+    source: string,
+}
+
+export component StudyBrowserWindow inherits Window {
+    title: "pacsleaf — Study Browser";
+    min-width: 900px;
+    min-height: 600px;
+    background: Theme.background;
+
+    in property <[StudyEntry]> studies: [];
+    in property <string> connection-status: "Disconnected";
+
+    callback search(string, string, string);
+    callback open-study(string);
+    callback import-files();
+
+    VerticalLayout {
+        // Top navigation bar
+        Rectangle {
+            height: 48px;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border;
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-xl;
+                padding-right: Theme.spacing-xl;
+                alignment: space-between;
+
+                // App title
+                HorizontalLayout {
+                    spacing: Theme.spacing-md;
+                    Text {
+                        text: "🍃 pacsleaf";
+                        color: Theme.accent-primary;
+                        font-size: Theme.font-xxl;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Mode tabs
+                HorizontalLayout {
+                    spacing: Theme.spacing-sm;
+                    alignment: center;
+
+                    Rectangle {
+                        width: 80px;
+                        height: 32px;
+                        border-radius: Theme.radius-md;
+                        background: Theme.accent-primary;
+                        Text {
+                            text: "Local";
+                            color: Theme.text-primary;
+                            font-size: Theme.font-sm;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Rectangle {
+                        width: 80px;
+                        height: 32px;
+                        border-radius: Theme.radius-md;
+                        background: Theme.surface-elevated;
+                        Text {
+                            text: "Network";
+                            color: Theme.text-secondary;
+                            font-size: Theme.font-sm;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Rectangle {
+                        width: 80px;
+                        height: 32px;
+                        border-radius: Theme.radius-md;
+                        background: Theme.surface-elevated;
+                        TouchArea {
+                            clicked => { root.import-files(); }
+                        }
+                        Text {
+                            text: "Import";
+                            color: Theme.text-secondary;
+                            font-size: Theme.font-sm;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                // Settings
+                Rectangle {
+                    width: 32px;
+                    height: 32px;
+                    border-radius: Theme.radius-md;
+
+                    Text {
+                        text: "⚙";
+                        font-size: Theme.font-xl;
+                        color: Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // Main content area
+        HorizontalLayout {
+            // Left: Search filters
+            Rectangle {
+                width: 220px;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                VerticalLayout {
+                    padding: Theme.spacing-lg;
+                    spacing: Theme.spacing-md;
+
+                    Text {
+                        text: "Search";
+                        color: Theme.text-primary;
+                        font-size: Theme.font-lg;
+                        font-weight: 600;
+                    }
+
+                    // Patient Name
+                    VerticalLayout {
+                        spacing: Theme.spacing-xs;
+                        Text {
+                            text: "Patient Name";
+                            color: Theme.text-secondary;
+                            font-size: Theme.font-xs;
+                        }
+                        Rectangle {
+                            height: 30px;
+                            border-radius: Theme.radius-sm;
+                            background: Theme.surface-elevated;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            patient-name-input := TextInput {
+                                color: Theme.text-primary;
+                                font-size: Theme.font-sm;
+                                horizontal-alignment: left;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    // Patient ID
+                    VerticalLayout {
+                        spacing: Theme.spacing-xs;
+                        Text {
+                            text: "Patient ID";
+                            color: Theme.text-secondary;
+                            font-size: Theme.font-xs;
+                        }
+                        Rectangle {
+                            height: 30px;
+                            border-radius: Theme.radius-sm;
+                            background: Theme.surface-elevated;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            patient-id-input := TextInput {
+                                color: Theme.text-primary;
+                                font-size: Theme.font-sm;
+                                horizontal-alignment: left;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    // Accession Number
+                    VerticalLayout {
+                        spacing: Theme.spacing-xs;
+                        Text {
+                            text: "Accession #";
+                            color: Theme.text-secondary;
+                            font-size: Theme.font-xs;
+                        }
+                        Rectangle {
+                            height: 30px;
+                            border-radius: Theme.radius-sm;
+                            background: Theme.surface-elevated;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            accession-input := TextInput {
+                                color: Theme.text-primary;
+                                font-size: Theme.font-sm;
+                                horizontal-alignment: left;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    // Search button
+                    Rectangle {
+                        height: 36px;
+                        border-radius: Theme.radius-md;
+                        background: Theme.accent-primary;
+                        TouchArea {
+                            clicked => {
+                                root.search(
+                                    patient-name-input.text,
+                                    patient-id-input.text,
+                                    accession-input.text,
+                                );
+                            }
+                        }
+                        Text {
+                            text: "Search";
+                            color: Theme.text-primary;
+                            font-size: Theme.font-sm;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            // Center: Study list
+            VerticalLayout {
+                Rectangle {
+                    background: Theme.background;
+
+                    VerticalLayout {
+                        // Column headers
+                        Rectangle {
+                            height: 32px;
+                            background: Theme.surface;
+
+                            HorizontalLayout {
+                                padding-left: Theme.spacing-lg;
+                                spacing: Theme.spacing-sm;
+
+                                Text { text: "Patient"; width: 180px; color: Theme.text-secondary; font-size: Theme.font-xs; font-weight: 600; vertical-alignment: center; }
+                                Text { text: "ID"; width: 100px; color: Theme.text-secondary; font-size: Theme.font-xs; font-weight: 600; vertical-alignment: center; }
+                                Text { text: "Date"; width: 90px; color: Theme.text-secondary; font-size: Theme.font-xs; font-weight: 600; vertical-alignment: center; }
+                                Text { text: "Mod"; width: 50px; color: Theme.text-secondary; font-size: Theme.font-xs; font-weight: 600; vertical-alignment: center; }
+                                Text { text: "Description"; color: Theme.text-secondary; font-size: Theme.font-xs; font-weight: 600; vertical-alignment: center; }
+                                Text { text: "Series"; width: 50px; color: Theme.text-secondary; font-size: Theme.font-xs; font-weight: 600; vertical-alignment: center; }
+                            }
+                        }
+
+                        // Study rows
+                        Flickable {
+                            viewport-height: studies.length * 36px;
+
+                            for study[index] in studies: Rectangle {
+                                y: index * 36px;
+                                height: 36px;
+                                background: touch-study.has-hover ? #ffffff08 : transparent;
+
+                                touch-study := TouchArea {
+                                    double-clicked => {
+                                        root.open-study(study.study-uid);
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    padding-left: Theme.spacing-lg;
+                                    spacing: Theme.spacing-sm;
+
+                                    Text { text: study.patient-name; width: 180px; color: Theme.text-primary; font-size: Theme.font-sm; vertical-alignment: center; overflow: elide; }
+                                    Text { text: study.patient-id; width: 100px; color: Theme.text-secondary; font-size: Theme.font-sm; vertical-alignment: center; overflow: elide; }
+                                    Text { text: study.study-date; width: 90px; color: Theme.text-secondary; font-size: Theme.font-sm; vertical-alignment: center; }
+                                    Text { text: study.modality; width: 50px; color: Theme.accent-primary; font-size: Theme.font-sm; font-weight: 600; vertical-alignment: center; }
+                                    Text { text: study.description; color: Theme.text-secondary; font-size: Theme.font-sm; vertical-alignment: center; overflow: elide; }
+                                    Text { text: study.series-count; width: 50px; color: Theme.text-secondary; font-size: Theme.font-sm; vertical-alignment: center; horizontal-alignment: center; }
+                                }
+
+                                Rectangle {
+                                    y: parent.height - 1px;
+                                    height: 1px;
+                                    background: Theme.border;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Status bar
+        StatusBar {
+            connection-status: root.connection-status;
+            study-info: studies.length == 0 ? "No studies" : studies.length == 1 ? "1 study" : "\{studies.length} studies";
+        }
+    }
+}

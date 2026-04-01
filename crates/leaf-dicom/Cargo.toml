@@ -1,0 +1,25 @@
+[package]
+name = "leaf-dicom"
+description = "DICOM bridge for pacsleaf (wraps dicom-toolkit-rs)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+leaf-core = { workspace = true }
+dicom-toolkit-core = { workspace = true }
+dicom-toolkit-dict = { workspace = true }
+dicom-toolkit-data = { workspace = true }
+dicom-toolkit-image = { workspace = true }
+dicom-toolkit-codec = { workspace = true }
+volren-core = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+glam = { workspace = true }
+rayon = { workspace = true }
+bytes = { workspace = true }
+lru = { workspace = true }
+parking_lot = { workspace = true }
+bytemuck = { workspace = true }
+chrono = { workspace = true }

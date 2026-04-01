@@ -1,0 +1,53 @@
+// Status bar at the bottom of the viewer window.
+
+import { Theme } from "../theme/theme.slint";
+
+export component StatusBar inherits Rectangle {
+    in property <string> connection-status: "Disconnected";
+    in property <string> study-info: "";
+    in property <string> image-count: "";
+
+    height: 28px;
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    HorizontalLayout {
+        padding-left: Theme.spacing-lg;
+        padding-right: Theme.spacing-lg;
+        alignment: space-between;
+
+        HorizontalLayout {
+            spacing: Theme.spacing-md;
+
+            Rectangle {
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: connection-status == "Connected" ? Theme.success : Theme.danger;
+                y: (parent.height - self.height) / 2;
+            }
+
+            Text {
+                text: connection-status;
+                color: Theme.text-secondary;
+                font-size: Theme.font-xs;
+                vertical-alignment: center;
+            }
+        }
+
+        Text {
+            text: study-info;
+            color: Theme.text-primary;
+            font-size: Theme.font-sm;
+            vertical-alignment: center;
+        }
+
+        Text {
+            text: image-count;
+            color: Theme.text-secondary;
+            font-size: Theme.font-xs;
+            vertical-alignment: center;
+        }
+    }
+}

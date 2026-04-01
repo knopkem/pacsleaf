@@ -1,0 +1,20 @@
+[package]
+name = "leaf-render"
+description = "Rendering engine for pacsleaf (2D + volume via volren-rs)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+leaf-core = { workspace = true }
+leaf-dicom = { workspace = true }
+volren-core = { workspace = true }
+volren-gpu = { workspace = true }
+wgpu = { workspace = true }
+glam = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+bytemuck = { workspace = true }
+lru = { workspace = true }
+parking_lot = { workspace = true }

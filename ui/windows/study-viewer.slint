@@ -1,0 +1,335 @@
+// pacsleaf Study Viewer Window
+// Multi-viewport DICOM viewer with toolbar, series strip, and measurement panel.
+
+import { Theme } from "../theme/theme.slint";
+import { ToolbarButton } from "../components/toolbar-button.slint";
+import { StatusBar } from "../components/status-bar.slint";
+
+// Active viewer tool
+export enum ViewerTool {
+    window-level,
+    pan,
+    zoom,
+    scroll,
+    line,
+    angle,
+    rectangle-roi,
+    ellipse-roi,
+    annotation,
+}
+
+// Series thumbnail in the strip
+export struct SeriesThumbnail {
+    series-uid: string,
+    series-number: int,
+    modality: string,
+    description: string,
+    instance-count: int,
+    active: bool,
+}
+
+// Measurement display in the panel
+export struct MeasurementEntry {
+    id: string,
+    kind: string,
+    value: string,
+    label: string,
+    slice-index: int,
+}
+
+export component StudyViewerWindow inherits Window {
+    title: "pacsleaf — Viewer";
+    min-width: 1024px;
+    min-height: 700px;
+    background: Theme.background;
+
+    in property <ViewerTool> active-tool: ViewerTool.window-level;
+    in property <[SeriesThumbnail]> series-list: [];
+    in property <[MeasurementEntry]> measurements: [];
+    in property <string> patient-name: "";
+    in property <string> study-description: "";
+    in property <string> window-info: "W:400 L:40";
+    in property <string> slice-info: "1/1";
+    in property <string> zoom-info: "100%";
+    in property <image> viewport-image;
+    in property <bool> measurement-panel-visible: false;
+
+    callback tool-selected(ViewerTool);
+    callback series-selected(string);
+    callback viewport-mouse-down(float, float);
+    callback viewport-mouse-move(float, float);
+    callback viewport-mouse-up(float, float);
+    callback viewport-scroll(float);
+    callback measurement-clicked(string);
+    callback reset-view();
+
+    VerticalLayout {
+        // Toolbar
+        Rectangle {
+            height: 44px;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border;
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-lg;
+                padding-right: Theme.spacing-lg;
+                spacing: Theme.spacing-sm;
+                alignment: start;
+
+                // Interaction tools
+                ToolbarButton {
+                    label: "W/L";
+                    active: active-tool == ViewerTool.window-level;
+                    clicked => { root.tool-selected(ViewerTool.window-level); }
+                }
+                ToolbarButton {
+                    label: "Pan";
+                    active: active-tool == ViewerTool.pan;
+                    clicked => { root.tool-selected(ViewerTool.pan); }
+                }
+                ToolbarButton {
+                    label: "Zoom";
+                    active: active-tool == ViewerTool.zoom;
+                    clicked => { root.tool-selected(ViewerTool.zoom); }
+                }
+
+                // Separator
+                Rectangle { width: 1px; height: 28px; background: Theme.border; }
+
+                // Measurement tools
+                ToolbarButton {
+                    label: "Line";
+                    active: active-tool == ViewerTool.line;
+                    clicked => { root.tool-selected(ViewerTool.line); }
+                }
+                ToolbarButton {
+                    label: "Angle";
+                    active: active-tool == ViewerTool.angle;
+                    clicked => { root.tool-selected(ViewerTool.angle); }
+                }
+                ToolbarButton {
+                    label: "ROI";
+                    active: active-tool == ViewerTool.rectangle-roi;
+                    clicked => { root.tool-selected(ViewerTool.rectangle-roi); }
+                }
+
+                // Separator
+                Rectangle { width: 1px; height: 28px; background: Theme.border; }
+
+                // Layout and actions
+                ToolbarButton {
+                    label: "Reset";
+                    clicked => { root.reset-view(); }
+                }
+
+                // Spacer
+                Rectangle { }
+
+                // Right-aligned info
+                Text {
+                    text: patient-name;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-sm;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // Main content: series strip | viewport | measurement panel
+        HorizontalLayout {
+            // Series thumbnail strip (left)
+            Rectangle {
+                width: 72px;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                Flickable {
+                    viewport-height: series-list.length * 82px;
+
+                    VerticalLayout {
+                        padding: Theme.spacing-sm;
+                        spacing: Theme.spacing-sm;
+
+                        for series[idx] in series-list: Rectangle {
+                            height: 76px;
+                            width: 64px;
+                            border-radius: Theme.radius-md;
+                            background: series.active ? Theme.accent-primary : Theme.surface-elevated;
+                            border-width: series.active ? 2px : 1px;
+                            border-color: series.active ? Theme.accent-hover : Theme.border;
+
+                            TouchArea {
+                                clicked => { root.series-selected(series.series-uid); }
+                            }
+
+                            VerticalLayout {
+                                padding: Theme.spacing-sm;
+                                alignment: end;
+
+                                Text {
+                                    text: series.modality;
+                                    color: Theme.accent-primary;
+                                    font-size: Theme.font-xxs;
+                                    font-weight: 700;
+                                }
+                                Text {
+                                    text: "#\{series.series-number}";
+                                    color: Theme.text-secondary;
+                                    font-size: Theme.font-xxs;
+                                }
+                                Text {
+                                    text: "\{series.instance-count} img";
+                                    color: Theme.text-muted;
+                                    font-size: Theme.font-xxs;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Center viewport
+            Rectangle {
+                background: #000000;
+
+                viewport-touch := TouchArea {
+                    pointer-event(event) => {
+                        // Forward to Rust via callbacks
+                    }
+                    moved => {
+                        root.viewport-mouse-move(self.mouse-x / 1px, self.mouse-y / 1px);
+                    }
+                    scroll-event(event) => {
+                        root.viewport-scroll(event.delta-y / 1px);
+                        return accept;
+                    }
+                }
+
+                // DICOM image rendered via wgpu (displayed as Slint Image)
+                Image {
+                    source: root.viewport-image;
+                    image-fit: contain;
+                }
+
+                // Top-left overlay: patient info
+                Text {
+                    x: 12px;
+                    y: 8px;
+                    text: root.patient-name;
+                    color: #F0F0F5CC;
+                    font-size: Theme.font-sm;
+                }
+                Text {
+                    x: 12px;
+                    y: 24px;
+                    text: root.study-description;
+                    color: #F0F0F599;
+                    font-size: Theme.font-xs;
+                }
+
+                // Bottom-left overlay: window/level
+                Text {
+                    x: 12px;
+                    y: parent.height - 36px;
+                    text: root.window-info;
+                    color: #F0F0F5CC;
+                    font-size: Theme.font-xs;
+                }
+
+                // Bottom-right overlay: slice info
+                Text {
+                    x: parent.width - 100px;
+                    y: parent.height - 36px;
+                    text: root.slice-info;
+                    color: #F0F0F5CC;
+                    font-size: Theme.font-xs;
+                }
+
+                // Zoom
+                Text {
+                    x: 12px;
+                    y: parent.height - 52px;
+                    text: root.zoom-info;
+                    color: #F0F0F599;
+                    font-size: Theme.font-xs;
+                }
+            }
+
+            // Measurement panel (right, collapsible)
+            if measurement-panel-visible: Rectangle {
+                width: 240px;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                VerticalLayout {
+                    padding: Theme.spacing-lg;
+                    spacing: Theme.spacing-md;
+
+                    Text {
+                        text: "Measurements";
+                        color: Theme.text-primary;
+                        font-size: Theme.font-lg;
+                        font-weight: 600;
+                    }
+
+                    Flickable {
+                        viewport-height: measurements.length * 52px;
+
+                        VerticalLayout {
+                            spacing: Theme.spacing-sm;
+
+                            for meas[idx] in measurements: Rectangle {
+                                height: 48px;
+                                border-radius: Theme.radius-sm;
+                                background: meas-touch.has-hover ? #ffffff08 : transparent;
+
+                                meas-touch := TouchArea {
+                                    clicked => { root.measurement-clicked(meas.id); }
+                                }
+
+                                VerticalLayout {
+                                    padding: Theme.spacing-sm;
+
+                                    HorizontalLayout {
+                                        Text {
+                                            text: meas.kind;
+                                            color: Theme.accent-gold;
+                                            font-size: Theme.font-xs;
+                                            font-weight: 600;
+                                        }
+                                        Rectangle { }
+                                        Text {
+                                            text: "Sl \{meas.slice-index}";
+                                            color: Theme.text-muted;
+                                            font-size: Theme.font-xxs;
+                                        }
+                                    }
+                                    Text {
+                                        text: meas.value;
+                                        color: Theme.text-primary;
+                                        font-size: Theme.font-sm;
+                                    }
+                                }
+
+                                Rectangle {
+                                    y: parent.height - 1px;
+                                    height: 1px;
+                                    background: Theme.border;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Status bar
+        StatusBar {
+            study-info: root.study-description;
+            image-count: root.slice-info;
+        }
+    }
+}

@@ -1,0 +1,40 @@
+// Reusable toolbar button component.
+
+import { Theme } from "../theme/theme.slint";
+
+export component ToolbarButton inherits Rectangle {
+    in property <string> label: "";
+    in property <image> icon;
+    in property <bool> active: false;
+    in property <bool> enabled: true;
+
+    callback clicked();
+
+    width: 36px;
+    height: 36px;
+    border-radius: Theme.radius-md;
+    background: active ? Theme.accent-primary : touch.has-hover ? #ffffff10 : transparent;
+
+    animate background { duration: 120ms; }
+
+    touch := TouchArea {
+        mouse-cursor: enabled ? pointer : default;
+        clicked => {
+            if (enabled) {
+                root.clicked();
+            }
+        }
+    }
+
+    VerticalLayout {
+        alignment: center;
+        HorizontalLayout {
+            alignment: center;
+            if (label != ""): Text {
+                text: label;
+                color: active ? Theme.text-primary : Theme.text-secondary;
+                font-size: Theme.font-xs;
+            }
+        }
+    }
+}
