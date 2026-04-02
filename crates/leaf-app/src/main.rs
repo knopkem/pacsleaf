@@ -561,7 +561,12 @@ fn open_remote_viewer_for_study(
     viewer.set_study_description(study_description.into());
     viewer.set_measurement_panel_visible(false);
     viewer.set_volume_preview_active(false);
+    viewer.set_quad_view_active(false);
     viewer.set_lut_label("Gray".into());
+    viewer.set_layout_label("1Up".into());
+    viewer.set_focused_quad_viewport(3);
+    viewer.set_advanced_preview_label("DVR".into());
+    viewer.set_volume_mode_label("Comp".into());
     viewer.set_orientation_top("".into());
     viewer.set_orientation_bottom("".into());
     viewer.set_orientation_left("".into());
@@ -633,6 +638,30 @@ fn open_remote_viewer_for_study(
     viewer.on_cycle_lut(move || {
         if let Some(viewer) = viewer_weak_for_lut.upgrade() {
             viewer.set_connection_status("Color LUTs are only available for local studies".into());
+        }
+    });
+    let viewer_weak_for_layout = viewer.as_weak();
+    viewer.on_toggle_layout(move || {
+        if let Some(viewer) = viewer_weak_for_layout.upgrade() {
+            viewer.set_connection_status(
+                "Multi-viewport layout is only available for local studies".into(),
+            );
+        }
+    });
+    let viewer_weak_for_advanced_mode = viewer.as_weak();
+    viewer.on_cycle_advanced_preview_mode(move || {
+        if let Some(viewer) = viewer_weak_for_advanced_mode.upgrade() {
+            viewer.set_connection_status(
+                "Advanced volume modes are only available for local studies".into(),
+            );
+        }
+    });
+    let viewer_weak_for_volume_mode = viewer.as_weak();
+    viewer.on_cycle_volume_mode(move || {
+        if let Some(viewer) = viewer_weak_for_volume_mode.upgrade() {
+            viewer.set_connection_status(
+                "3D blend modes are only available for local studies".into(),
+            );
         }
     });
     viewer.window().on_close_requested(move || {
@@ -732,11 +761,16 @@ fn update_remote_viewer_image(
             .map_err(|error| LeafError::Render(error.to_string()))?,
     );
     viewer.set_volume_preview_active(false);
+    viewer.set_quad_view_active(false);
     viewer.set_image_rotated(false);
     viewer.set_image_flipped_h(false);
     viewer.set_image_flipped_v(false);
     viewer.set_image_inverted(false);
     viewer.set_lut_label("Gray".into());
+    viewer.set_layout_label("1Up".into());
+    viewer.set_focused_quad_viewport(3);
+    viewer.set_advanced_preview_label("DVR".into());
+    viewer.set_volume_mode_label("Comp".into());
     viewer.set_orientation_top("".into());
     viewer.set_orientation_bottom("".into());
     viewer.set_orientation_left("".into());

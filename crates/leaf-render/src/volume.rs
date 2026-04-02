@@ -9,8 +9,9 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc;
 use tracing::info;
 use volren_core::{
-    BlendMode, Camera, ColorSpace, ColorTransferFunction, DynVolume, OpacityTransferFunction,
-    Projection, ShadingParams, VolumeInfo, VolumeRenderParams,
+    Aabb, BlendMode, Camera, ColorSpace, ColorTransferFunction, DynVolume, OpacityTransferFunction,
+    Projection, ShadingParams, SlicePlane, ThickSlabMode, ThickSlabParams, VolumeInfo,
+    VolumeRenderParams, WindowLevel,
 };
 use volren_gpu::{Viewport, VolumeRenderer};
 
@@ -86,6 +87,22 @@ impl PreparedVolume {
     pub fn scalar_range(&self) -> (f64, f64) {
         self.volume.scalar_range()
     }
+
+    /// World-space bounds of the prepared volume.
+    pub fn world_bounds(&self) -> Aabb {
+        self.volume.world_bounds()
+    }
+
+    /// Suggested scroll step for axis-aligned MPR slicing.
+    pub fn slice_scroll_step(&self, mode: SlicePreviewMode) -> f64 {
+        let spacing = self.volume.spacing();
+        match mode {
+            SlicePreviewMode::Axial => spacing.z.abs(),
+            SlicePreviewMode::Coronal => spacing.y.abs(),
+            SlicePreviewMode::Sagittal => spacing.x.abs(),
+        }
+        .max(0.5)
+    }
 }
 
 /// Pacsleaf-facing volume blend modes.
@@ -106,6 +123,176 @@ impl VolumeBlendMode {
             Self::MinimumIntensity => BlendMode::MinimumIntensity,
             Self::AverageIntensity => BlendMode::AverageIntensity,
         }
+    }
+}
+
+/// Axis-aligned single-viewport MPR modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SlicePreviewMode {
+    #[default]
+    Axial,
+    Coronal,
+    Sagittal,
+}
+
+/// Projection style for a single-slice or slab MPR preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SliceProjectionMode {
+    #[default]
+    Thin,
+    MaximumIntensity,
+    MinimumIntensity,
+    AverageIntensity,
+}
+
+/// Mutable state for a single MPR slice preview.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlicePreviewState {
+    pub mode: SlicePreviewMode,
+    pub offset: f64,
+    pub orientation: DQuat,
+    pub projection_mode: SliceProjectionMode,
+    pub slab_half_thickness: f64,
+    pub crosshair_world: Option<DVec3>,
+    pub transfer_center_hu: Option<f64>,
+    pub transfer_width_hu: Option<f64>,
+}
+
+impl Default for SlicePreviewState {
+    fn default() -> Self {
+        Self {
+            mode: SlicePreviewMode::Axial,
+            offset: 0.0,
+            orientation: DQuat::IDENTITY,
+            projection_mode: SliceProjectionMode::Thin,
+            slab_half_thickness: 0.0,
+            crosshair_world: None,
+            transfer_center_hu: None,
+            transfer_width_hu: None,
+        }
+    }
+}
+
+impl SlicePreviewState {
+    /// Ensure the reslice preview has a modality-appropriate window.
+    pub fn ensure_transfer_window(&mut self, scalar_min: f64, scalar_max: f64) {
+        let (center, width) = resolved_slice_transfer_window(*self, scalar_min, scalar_max);
+        self.transfer_center_hu.get_or_insert(center);
+        self.transfer_width_hu.get_or_insert(width);
+    }
+
+    /// Read the current slice window, falling back to sensible defaults.
+    pub fn transfer_window(&self, scalar_min: f64, scalar_max: f64) -> (f64, f64) {
+        resolved_slice_transfer_window(*self, scalar_min, scalar_max)
+    }
+
+    /// Update the slice transfer window while keeping it in a safe range.
+    pub fn set_transfer_window(
+        &mut self,
+        center: f64,
+        width: f64,
+        scalar_min: f64,
+        scalar_max: f64,
+    ) {
+        let (center, width) = clamp_transfer_window(center, width, scalar_min, scalar_max);
+        self.transfer_center_hu = Some(center);
+        self.transfer_width_hu = Some(width);
+    }
+
+    /// Reset the preview back to the centred default slice for the current orientation.
+    pub fn reset(&mut self) {
+        self.offset = 0.0;
+        self.orientation = DQuat::IDENTITY;
+        self.crosshair_world = None;
+        self.transfer_center_hu = None;
+        self.transfer_width_hu = None;
+    }
+
+    /// Switch to a new orthogonal slice mode.
+    pub fn set_mode(&mut self, mode: SlicePreviewMode) {
+        self.mode = mode;
+    }
+
+    /// Resolve the current slice plane against a prepared volume bound.
+    pub fn slice_plane(&self, bounds: Aabb) -> SlicePlane {
+        slice_plane_for_state(bounds, *self)
+    }
+
+    /// The active crosshair world point, defaulting to the volume center.
+    pub fn crosshair_world(&self, bounds: Aabb) -> DVec3 {
+        self.crosshair_world.unwrap_or(bounds.center())
+    }
+
+    /// Update the shared crosshair point in world space.
+    pub fn set_crosshair_world(&mut self, world: DVec3) {
+        self.crosshair_world = Some(world);
+    }
+
+    /// Move the current slice so it passes through the given world-space point.
+    pub fn center_on_world(&mut self, world: DVec3, bounds: Aabb) {
+        let center = bounds.center();
+        let normal = self.slice_plane(bounds).normal();
+        let unclamped_offset = (world - center).dot(normal);
+        self.offset = unclamped_offset;
+        self.clamp_offset(bounds);
+        self.crosshair_world = Some(world + normal * (self.offset - unclamped_offset));
+    }
+
+    /// Move the current slice so it passes through the active crosshair point.
+    pub fn center_on_crosshair(&mut self, bounds: Aabb) {
+        let world = self.crosshair_world(bounds);
+        self.center_on_world(world, bounds);
+    }
+
+    /// Advance to the next slab projection mode.
+    pub fn cycle_projection_mode(&mut self, default_half_thickness: f64) {
+        self.projection_mode = match self.projection_mode {
+            SliceProjectionMode::Thin => SliceProjectionMode::MaximumIntensity,
+            SliceProjectionMode::MaximumIntensity => SliceProjectionMode::MinimumIntensity,
+            SliceProjectionMode::MinimumIntensity => SliceProjectionMode::AverageIntensity,
+            SliceProjectionMode::AverageIntensity => SliceProjectionMode::Thin,
+        };
+        self.slab_half_thickness = if matches!(self.projection_mode, SliceProjectionMode::Thin) {
+            0.0
+        } else {
+            default_half_thickness.max(0.5)
+        };
+    }
+
+    /// Resolve thick-slab parameters for the current projection mode.
+    pub fn thick_slab(self) -> Option<ThickSlabParams> {
+        let mode = match self.projection_mode {
+            SliceProjectionMode::Thin => return None,
+            SliceProjectionMode::MaximumIntensity => ThickSlabMode::Mip,
+            SliceProjectionMode::MinimumIntensity => ThickSlabMode::MinIp,
+            SliceProjectionMode::AverageIntensity => ThickSlabMode::Mean,
+        };
+        Some(ThickSlabParams {
+            half_thickness: self.slab_half_thickness.max(0.5),
+            mode,
+            num_samples: 16,
+        })
+    }
+
+    /// Clamp the current offset to the volume bounds for the active axis.
+    pub fn clamp_offset(&mut self, bounds: Aabb) {
+        let (min_offset, max_offset) =
+            slice_offset_range(bounds, self.slice_plane(bounds).normal());
+        self.offset = self.offset.clamp(min_offset, max_offset);
+    }
+
+    /// Scroll the current slice by `delta` world units and keep it within bounds.
+    pub fn scroll_by(&mut self, delta: f64, bounds: Aabb) {
+        let world = self.crosshair_world(bounds) + self.slice_plane(bounds).normal() * delta;
+        self.center_on_world(world, bounds);
+    }
+
+    /// Rotate the shared MPR cursor around the current plane normal.
+    pub fn rotate_about_normal(&mut self, angle_rad: f64, bounds: Aabb) {
+        let axis = self.slice_plane(bounds).normal();
+        let rotation = DQuat::from_axis_angle(axis.normalize_or(DVec3::Z), angle_rad);
+        self.orientation = (rotation * self.orientation).normalize();
+        self.center_on_crosshair(bounds);
     }
 }
 
@@ -318,6 +505,111 @@ impl VolumePreviewRenderer {
             } else {
                 self.renderer
                     .render_volume(&mut encoder, &view, &camera, &render_params, viewport)
+                    .map_err(|error| LeafError::Render(error.to_string()))?;
+            }
+            encoder.copy_texture_to_buffer(
+                texture.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback.buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(readback.padded_bytes_per_row),
+                        rows_per_image: Some(height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.queue.submit(std::iter::once(encoder.finish()));
+
+            Ok(VolumePreviewImage {
+                width,
+                height,
+                rgba: read_buffer(
+                    &self.device,
+                    &readback.buffer,
+                    width,
+                    height,
+                    readback.padded_bytes_per_row,
+                )?,
+            })
+        })
+    }
+
+    /// Render a single orthogonal MPR slice for an already prepared volume.
+    pub fn render_prepared_slice_preview(
+        &mut self,
+        prepared: &PreparedVolume,
+        view_state: &SlicePreviewState,
+        width: u32,
+        height: u32,
+        show_crosshair: bool,
+    ) -> LeafResult<VolumePreviewImage> {
+        if width == 0 || height == 0 {
+            return Err(LeafError::InvalidArgument(
+                "Slice preview dimensions must be non-zero".into(),
+            ));
+        }
+
+        let bounds = prepared.world_bounds();
+        let slice_plane = view_state.slice_plane(bounds);
+        let (scalar_min, scalar_max) = prepared.scalar_range();
+        let (center, width_hu) = view_state.transfer_window(scalar_min, scalar_max);
+        let window_level = WindowLevel::new(center, width_hu.max(1.0));
+        let thick_slab = view_state.thick_slab();
+        let crosshair_world = view_state.crosshair_world(bounds);
+
+        with_volren_panic_boundary("rendering the MPR slice preview", || {
+            self.ensure_prepared_volume_uploaded(prepared);
+            self.ensure_preview_target(width, height);
+            self.ensure_readback_buffer(width, height);
+
+            let texture = &self
+                .preview_target
+                .as_ref()
+                .ok_or_else(|| LeafError::Render("Preview target unavailable".into()))?
+                .texture;
+            let readback = self
+                .readback_buffer
+                .as_ref()
+                .ok_or_else(|| LeafError::Render("Preview readback buffer unavailable".into()))?;
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pacsleaf_slice_preview_encoder"),
+                });
+            clear_render_target(&mut encoder, &view);
+            self.renderer
+                .render_slice(
+                    &mut encoder,
+                    &view,
+                    &slice_plane,
+                    &window_level,
+                    Viewport::full(width, height),
+                    thick_slab.as_ref(),
+                )
+                .map_err(|error| LeafError::Render(error.to_string()))?;
+            let (crosshair_uv, _) = slice_plane.world_to_point(crosshair_world);
+            if show_crosshair
+                && (0.0..=1.0).contains(&crosshair_uv.x)
+                && (0.0..=1.0).contains(&crosshair_uv.y)
+            {
+                self.renderer
+                    .render_crosshair(
+                        &mut encoder,
+                        &view,
+                        Viewport::full(width, height),
+                        &volren_gpu::CrosshairParams {
+                            position: [crosshair_uv.x as f32, crosshair_uv.y as f32],
+                            horizontal_color: [1.0, 0.72, 0.2, 0.9],
+                            vertical_color: [0.25, 0.85, 1.0, 0.9],
+                            thickness: 1.5,
+                        },
+                    )
                     .map_err(|error| LeafError::Render(error.to_string()))?;
             }
             encoder.copy_texture_to_buffer(
@@ -634,12 +926,107 @@ fn resolved_transfer_window(
     )
 }
 
+fn resolved_slice_transfer_window(
+    view_state: SlicePreviewState,
+    scalar_min: f64,
+    scalar_max: f64,
+) -> (f64, f64) {
+    let range = (scalar_max - scalar_min).max(1.0);
+    clamp_transfer_window(
+        view_state
+            .transfer_center_hu
+            .unwrap_or(scalar_min + range * 0.5),
+        view_state.transfer_width_hu.unwrap_or(range),
+        scalar_min,
+        scalar_max,
+    )
+}
+
 fn clamp_transfer_window(center: f64, width: f64, scalar_min: f64, scalar_max: f64) -> (f64, f64) {
     let range = (scalar_max - scalar_min).max(1.0);
     (
         center.clamp(scalar_min - range * 0.25, scalar_max + range * 0.25),
         width.clamp(range / 200.0, range * 1.25),
     )
+}
+
+fn slice_basis_for_mode(mode: SlicePreviewMode) -> (DVec3, DVec3) {
+    match mode {
+        SlicePreviewMode::Axial => (DVec3::X, DVec3::Y),
+        SlicePreviewMode::Coronal => (DVec3::X, -DVec3::Z),
+        SlicePreviewMode::Sagittal => (DVec3::Y, -DVec3::Z),
+    }
+}
+
+fn slice_preferred_up_for_mode(mode: SlicePreviewMode) -> DVec3 {
+    match mode {
+        SlicePreviewMode::Axial => DVec3::Y,
+        SlicePreviewMode::Coronal | SlicePreviewMode::Sagittal => -DVec3::Z,
+    }
+}
+
+fn slice_basis_from_normal(mode: SlicePreviewMode, normal: DVec3) -> (DVec3, DVec3) {
+    let project_reference = |reference: DVec3| {
+        let projected = reference - normal * reference.dot(normal);
+        (projected.length_squared() > 1.0e-10).then(|| projected.normalize())
+    };
+
+    let up = project_reference(slice_preferred_up_for_mode(mode))
+        .or_else(|| {
+            [DVec3::X, DVec3::Y, DVec3::Z]
+                .into_iter()
+                .filter_map(project_reference)
+                .next()
+        })
+        .unwrap_or(DVec3::Y);
+    let right = up.cross(normal).normalize_or(DVec3::X);
+    let up = normal.cross(right).normalize_or(up);
+    (right, up)
+}
+
+fn slice_offset_range(bounds: Aabb, normal: DVec3) -> (f64, f64) {
+    let center = bounds.center();
+    let corners = [
+        DVec3::new(bounds.min.x, bounds.min.y, bounds.min.z),
+        DVec3::new(bounds.min.x, bounds.min.y, bounds.max.z),
+        DVec3::new(bounds.min.x, bounds.max.y, bounds.min.z),
+        DVec3::new(bounds.min.x, bounds.max.y, bounds.max.z),
+        DVec3::new(bounds.max.x, bounds.min.y, bounds.min.z),
+        DVec3::new(bounds.max.x, bounds.min.y, bounds.max.z),
+        DVec3::new(bounds.max.x, bounds.max.y, bounds.min.z),
+        DVec3::new(bounds.max.x, bounds.max.y, bounds.max.z),
+    ];
+    let mut min_offset = f64::INFINITY;
+    let mut max_offset = f64::NEG_INFINITY;
+    for corner in corners {
+        let offset = (corner - center).dot(normal);
+        min_offset = min_offset.min(offset);
+        max_offset = max_offset.max(offset);
+    }
+    (min_offset, max_offset)
+}
+
+fn slice_plane_for_state(bounds: Aabb, view_state: SlicePreviewState) -> SlicePlane {
+    let center = bounds.center();
+    let size = bounds.size();
+    let (base_right, base_up) = slice_basis_for_mode(view_state.mode);
+    let default_normal = base_right.cross(base_up).normalize_or(DVec3::Z);
+    let normal = (view_state.orientation * default_normal).normalize_or(default_normal);
+    let (right, up) = slice_basis_from_normal(view_state.mode, normal);
+    let (min_offset, max_offset) = slice_offset_range(bounds, normal);
+    let clamped_offset = view_state.offset.clamp(min_offset, max_offset);
+    let origin = center + normal * clamped_offset;
+    match view_state.mode {
+        SlicePreviewMode::Axial => {
+            SlicePlane::new(origin, right, up, size.x.max(1.0), size.y.max(1.0))
+        }
+        SlicePreviewMode::Coronal => {
+            SlicePlane::new(origin, right, up, size.x.max(1.0), size.z.max(1.0))
+        }
+        SlicePreviewMode::Sagittal => {
+            SlicePlane::new(origin, right, up, size.y.max(1.0), size.z.max(1.0))
+        }
+    }
 }
 
 fn kpacs_windowed_soft_tissue_opacity_transfer_function(
@@ -872,6 +1259,31 @@ mod tests {
             .into()
     }
 
+    fn z_gradient_volume() -> DynVolume {
+        let size = UVec3::new(16, 16, 16);
+        let mut voxels = Vec::with_capacity((size.x * size.y * size.z) as usize);
+        for z in 0..size.z {
+            for _y in 0..size.y {
+                for _x in 0..size.x {
+                    voxels.push((z as i16) * 200);
+                }
+            }
+        }
+        Volume::from_data(voxels, size, DVec3::ONE, DVec3::ZERO, DMat3::IDENTITY, 1)
+            .expect("valid z-gradient volume")
+            .into()
+    }
+
+    fn average_row_luma(image: &VolumePreviewImage, row: u32) -> f64 {
+        let start = (row * image.width * 4) as usize;
+        let end = start + (image.width * 4) as usize;
+        image.rgba[start..end]
+            .chunks_exact(4)
+            .map(|px| (f64::from(px[0]) + f64::from(px[1]) + f64::from(px[2])) / 3.0)
+            .sum::<f64>()
+            / f64::from(image.width)
+    }
+
     #[test]
     fn preview_camera_targets_volume_center() {
         let volume = demo_volume();
@@ -934,6 +1346,90 @@ mod tests {
     }
 
     #[test]
+    fn slice_preview_state_clamps_scroll_to_volume_bounds() {
+        let bounds = Aabb::new(DVec3::ZERO, DVec3::new(10.0, 20.0, 30.0));
+        let mut state = SlicePreviewState::default();
+        state.scroll_by(100.0, bounds);
+        assert_eq!(state.offset, 15.0);
+        state.scroll_by(-100.0, bounds);
+        assert_eq!(state.offset, -15.0);
+    }
+
+    #[test]
+    fn slice_plane_tracks_requested_orientation() {
+        let bounds = Aabb::new(DVec3::ZERO, DVec3::new(10.0, 20.0, 30.0));
+        let mut state = SlicePreviewState::default();
+        state.set_mode(SlicePreviewMode::Coronal);
+        state.offset = 4.0;
+        let plane = slice_plane_for_state(bounds, state);
+        assert_eq!(plane.origin.y, 14.0);
+        assert_eq!(plane.width, 10.0);
+        assert_eq!(plane.height, 30.0);
+    }
+
+    #[test]
+    fn slice_default_planes_follow_radiology_view_conventions() {
+        let bounds = Aabb::new(DVec3::ZERO, DVec3::new(10.0, 20.0, 30.0));
+
+        let mut coronal = SlicePreviewState::default();
+        coronal.set_mode(SlicePreviewMode::Coronal);
+        let coronal_plane = coronal.slice_plane(bounds);
+        assert!(coronal_plane.right.distance(DVec3::X) < 1.0e-6);
+        assert!(coronal_plane.up.distance(-DVec3::Z) < 1.0e-6);
+
+        let mut sagittal = SlicePreviewState::default();
+        sagittal.set_mode(SlicePreviewMode::Sagittal);
+        let sagittal_plane = sagittal.slice_plane(bounds);
+        assert!(sagittal_plane.right.distance(DVec3::Y) < 1.0e-6);
+        assert!(sagittal_plane.up.distance(-DVec3::Z) < 1.0e-6);
+    }
+
+    #[test]
+    fn slice_projection_mode_cycles_into_thick_slab() {
+        let mut state = SlicePreviewState::default();
+        state.cycle_projection_mode(6.0);
+        assert_eq!(state.projection_mode, SliceProjectionMode::MaximumIntensity);
+        assert_eq!(state.slab_half_thickness, 6.0);
+        assert!(state.thick_slab().is_some());
+    }
+
+    #[test]
+    fn slice_crosshair_defaults_to_volume_center() {
+        let bounds = Aabb::new(DVec3::ZERO, DVec3::new(10.0, 20.0, 30.0));
+        let state = SlicePreviewState::default();
+        assert_eq!(state.crosshair_world(bounds), bounds.center());
+    }
+
+    #[test]
+    fn slice_center_on_world_updates_offset_for_mode() {
+        let bounds = Aabb::new(DVec3::ZERO, DVec3::new(10.0, 20.0, 30.0));
+        let mut state = SlicePreviewState::default();
+        state.center_on_world(DVec3::new(4.0, 9.0, 23.0), bounds);
+        assert_eq!(state.offset, 8.0);
+
+        state.set_mode(SlicePreviewMode::Sagittal);
+        state.center_on_crosshair(bounds);
+        assert_eq!(state.offset, 1.0);
+    }
+
+    #[test]
+    fn slice_rotation_keeps_plane_family_orthogonal() {
+        let bounds = Aabb::new(DVec3::ZERO, DVec3::new(10.0, 20.0, 30.0));
+        let mut axial = SlicePreviewState::default();
+        axial.rotate_about_normal(std::f64::consts::FRAC_PI_4, bounds);
+        let axial_plane = axial.slice_plane(bounds);
+        assert!(axial_plane.right.distance(DVec3::X) < 1.0e-6);
+        assert!(axial_plane.up.distance(DVec3::Y) < 1.0e-6);
+
+        let mut sagittal = axial;
+        sagittal.set_mode(SlicePreviewMode::Sagittal);
+        sagittal.center_on_crosshair(bounds);
+        let sagittal_plane = sagittal.slice_plane(bounds);
+        assert!(sagittal_plane.normal().dot(axial_plane.normal()).abs() < 1.0e-6);
+        assert!(sagittal_plane.normal().distance(DVec3::X) > 1.0e-3);
+    }
+
+    #[test]
     fn upstream_shader_panic_is_reported_concisely() {
         let error = with_volren_panic_boundary("initializing the renderer", || -> LeafResult<()> {
             panic!("wgpu error: Validation Error\nShader 'volren_reslice_shader' parsing error: expected `;`, found \"num_samples\"");
@@ -985,6 +1481,44 @@ mod tests {
         assert!(
             interactive_average < full_average,
             "interactive preview should outperform full-quality preview"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a working GPU adapter"]
+    fn rendered_coronal_and_sagittal_place_superior_at_top() {
+        let mut renderer = VolumePreviewRenderer::new().expect("GPU renderer");
+        let prepared = PreparedVolume {
+            volume: z_gradient_volume(),
+            cache_key: "z-gradient-mpr".to_string(),
+        };
+        let mut coronal = SlicePreviewState::default();
+        coronal.set_mode(SlicePreviewMode::Coronal);
+        coronal.transfer_center_hu = Some(1500.0);
+        coronal.transfer_width_hu = Some(4000.0);
+
+        let mut sagittal = coronal;
+        sagittal.set_mode(SlicePreviewMode::Sagittal);
+
+        let coronal_image = renderer
+            .render_prepared_slice_preview(&prepared, &coronal, 64, 64, false)
+            .expect("coronal render");
+        let sagittal_image = renderer
+            .render_prepared_slice_preview(&prepared, &sagittal, 64, 64, false)
+            .expect("sagittal render");
+
+        let coronal_top = average_row_luma(&coronal_image, 0);
+        let coronal_bottom = average_row_luma(&coronal_image, coronal_image.height - 1);
+        let sagittal_top = average_row_luma(&sagittal_image, 0);
+        let sagittal_bottom = average_row_luma(&sagittal_image, sagittal_image.height - 1);
+
+        assert!(
+            coronal_top > coronal_bottom,
+            "expected superior-at-top coronal render, got top={coronal_top} bottom={coronal_bottom}"
+        );
+        assert!(
+            sagittal_top > sagittal_bottom,
+            "expected superior-at-top sagittal render, got top={sagittal_top} bottom={sagittal_bottom}"
         );
     }
 }

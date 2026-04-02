@@ -54,6 +54,180 @@ export struct MeasurementOverlay {
     h4-x: float, h4-y: float,
 }
 
+export struct QuadReferenceLine {
+    commands: string,
+    h1-x: float, h1-y: float,
+    h2-x: float, h2-y: float,
+    kind: int,
+    active: bool,
+}
+
+component QuadViewportTile inherits Rectangle {
+    in property <image> viewport-image;
+    in property <string> title;
+    in property <string> info;
+    in property <bool> active;
+    in property <int> tile-index;
+    in property <[QuadReferenceLine]> reference-lines: [];
+    in property <string> orientation-top: "";
+    in property <string> orientation-bottom: "";
+    in property <string> orientation-left: "";
+    in property <string> orientation-right: "";
+    in property <float> crosshair-x: 0;
+    in property <float> crosshair-y: 0;
+    in property <bool> crosshair-visible: false;
+    in property <bool> crosshair-active: false;
+
+    callback mouse-down(int, float, float, float, float, int);
+    callback mouse-move(int, float, float, float, float);
+    callback mouse-up(int, float, float, float, float);
+    callback scroll(int, float);
+
+    background: active ? #0D1217 : #000000;
+    border-width: active ? 2px : 1px;
+    border-color: active ? Theme.accent-primary : Theme.border;
+    clip: true;
+
+    viewport-touch := TouchArea {
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                if (event.button == PointerEventButton.right) {
+                    root.mouse-down(root.tile-index, self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px, 2);
+                } else {
+                    root.mouse-down(root.tile-index, self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px, 0);
+                }
+            } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                root.mouse-up(root.tile-index, self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px);
+            }
+        }
+        moved => {
+            root.mouse-move(root.tile-index, self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px);
+        }
+        scroll-event(event) => {
+            root.scroll(root.tile-index, event.delta-y / 1px);
+            return accept;
+        }
+    }
+
+    Image {
+        width: parent.width;
+        height: parent.height;
+        source: root.viewport-image;
+        image-fit: contain;
+    }
+
+    for line[idx] in reference-lines: Path {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        viewbox-x: 0;
+        viewbox-y: 0;
+        viewbox-width: parent.width / 1px;
+        viewbox-height: parent.height / 1px;
+        commands: line.commands;
+        fill: transparent;
+        stroke: line.active ? Theme.accent-hover : (line.kind == 0 ? #4FC3F7 : (line.kind == 1 ? #8BC34A : #FFB74D));
+        stroke-width: line.active ? 3px : 2px;
+        stroke-line-cap: round;
+    }
+
+    for line[idx] in reference-lines: Rectangle {
+        x: line.h1-x * 1px - (line.active ? 4px : 3px);
+        y: line.h1-y * 1px - (line.active ? 4px : 3px);
+        width: line.active ? 8px : 6px;
+        height: line.active ? 8px : 6px;
+        border-radius: line.active ? 4px : 3px;
+        background: line.active ? Theme.accent-hover : (line.kind == 0 ? #4FC3F7 : (line.kind == 1 ? #8BC34A : #FFB74D));
+    }
+
+    for line[idx] in reference-lines: Rectangle {
+        x: line.h2-x * 1px - (line.active ? 4px : 3px);
+        y: line.h2-y * 1px - (line.active ? 4px : 3px);
+        width: line.active ? 8px : 6px;
+        height: line.active ? 8px : 6px;
+        border-radius: line.active ? 4px : 3px;
+        background: line.active ? Theme.accent-hover : (line.kind == 0 ? #4FC3F7 : (line.kind == 1 ? #8BC34A : #FFB74D));
+    }
+
+    Rectangle {
+        visible: root.crosshair-visible;
+        x: root.crosshair-x * 1px - (root.crosshair-active ? 7px : 6px);
+        y: root.crosshair-y * 1px - (root.crosshair-active ? 7px : 6px);
+        width: root.crosshair-active ? 14px : 12px;
+        height: root.crosshair-active ? 14px : 12px;
+        border-radius: self.width / 2;
+        border-width: 2px;
+        border-color: root.crosshair-active ? Theme.accent-hover : #F0F0F5CC;
+        background: #00000088;
+    }
+
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: 28px;
+        background: #00000066;
+
+        Text {
+            x: 8px;
+            y: 6px;
+            text: root.title;
+            color: Theme.text-primary;
+            font-size: Theme.font-xs;
+            font-weight: 600;
+        }
+
+        Text {
+            x: (parent.width - self.width) / 2;
+            y: 6px;
+            text: root.orientation-top;
+            visible: root.orientation-top != "";
+            color: #F0F0F5CC;
+            font-size: Theme.font-xs;
+            font-weight: 600;
+        }
+    }
+
+    Text {
+        x: 8px;
+        y: (parent.height - self.height) / 2;
+        text: root.orientation-left;
+        visible: root.orientation-left != "";
+        color: #F0F0F5CC;
+        font-size: Theme.font-xs;
+        font-weight: 600;
+    }
+
+    Text {
+        x: parent.width - self.width - 8px;
+        y: (parent.height - self.height) / 2;
+        text: root.orientation-right;
+        visible: root.orientation-right != "";
+        color: #F0F0F5CC;
+        font-size: Theme.font-xs;
+        font-weight: 600;
+    }
+
+    if info != "": Text {
+        x: 8px;
+        y: parent.height - 22px;
+        text: root.info;
+        color: #F0F0F5B0;
+        font-size: Theme.font-xxs;
+    }
+
+    Text {
+        x: (parent.width - self.width) / 2;
+        y: parent.height - 22px;
+        text: root.orientation-bottom;
+        visible: root.orientation-bottom != "";
+        color: #F0F0F5CC;
+        font-size: Theme.font-xs;
+        font-weight: 600;
+    }
+}
+
 export component StudyViewerWindow inherits Window {
     title: "pacsleaf — Viewer";
     preferred-width: 1440px;
@@ -74,6 +248,9 @@ export component StudyViewerWindow inherits Window {
     in property <string> slice-info: "1/1";
     in property <string> zoom-info: "100%";
     in property <string> lut-label: "Gray";
+    in property <string> layout-label: "1Up";
+    in property <string> advanced-preview-label: "DVR";
+    in property <string> volume-mode-label: "Comp";
     in property <string> orientation-top: "";
     in property <string> orientation-bottom: "";
     in property <string> orientation-left: "";
@@ -81,6 +258,8 @@ export component StudyViewerWindow inherits Window {
     in property <image> viewport-image;
     in property <bool> measurement-panel-visible: false;
     in property <bool> volume-preview-active: false;
+    in property <bool> quad-view-active: false;
+    in property <int> focused-quad-viewport: 3;
     in property <bool> image-rotated: false;
     in property <bool> image-flipped-h: false;
     in property <bool> image-flipped-v: false;
@@ -88,6 +267,41 @@ export component StudyViewerWindow inherits Window {
     in-out property <float> viewport-scale: 1.0;
     in-out property <float> viewport-offset-x: 0.0;
     in-out property <float> viewport-offset-y: 0.0;
+    in property <image> quad-axial-image;
+    in property <image> quad-coronal-image;
+    in property <image> quad-sagittal-image;
+    in property <image> quad-dvr-image;
+    in property <string> quad-axial-info: "";
+    in property <string> quad-coronal-info: "";
+    in property <string> quad-sagittal-info: "";
+    in property <string> quad-dvr-info: "";
+    in property <string> quad-axial-orientation-top: "";
+    in property <string> quad-axial-orientation-bottom: "";
+    in property <string> quad-axial-orientation-left: "";
+    in property <string> quad-axial-orientation-right: "";
+    in property <string> quad-coronal-orientation-top: "";
+    in property <string> quad-coronal-orientation-bottom: "";
+    in property <string> quad-coronal-orientation-left: "";
+    in property <string> quad-coronal-orientation-right: "";
+    in property <string> quad-sagittal-orientation-top: "";
+    in property <string> quad-sagittal-orientation-bottom: "";
+    in property <string> quad-sagittal-orientation-left: "";
+    in property <string> quad-sagittal-orientation-right: "";
+    in property <float> quad-axial-crosshair-x: 0;
+    in property <float> quad-axial-crosshair-y: 0;
+    in property <bool> quad-axial-crosshair-visible: false;
+    in property <bool> quad-axial-crosshair-active: false;
+    in property <float> quad-coronal-crosshair-x: 0;
+    in property <float> quad-coronal-crosshair-y: 0;
+    in property <bool> quad-coronal-crosshair-visible: false;
+    in property <bool> quad-coronal-crosshair-active: false;
+    in property <float> quad-sagittal-crosshair-x: 0;
+    in property <float> quad-sagittal-crosshair-y: 0;
+    in property <bool> quad-sagittal-crosshair-visible: false;
+    in property <bool> quad-sagittal-crosshair-active: false;
+    in property <[QuadReferenceLine]> quad-axial-reference-lines: [];
+    in property <[QuadReferenceLine]> quad-coronal-reference-lines: [];
+    in property <[QuadReferenceLine]> quad-sagittal-reference-lines: [];
 
     callback tool-selected(ViewerTool);
     callback series-selected(string);
@@ -101,11 +315,18 @@ export component StudyViewerWindow inherits Window {
     callback flip-vertical();
     callback invert-image();
     callback cycle-lut();
+    callback toggle-layout();
+    callback cycle-advanced-preview-mode();
+    callback cycle-volume-mode();
     callback measurement-clicked(string);
     callback measurement-deleted(string);
     callback reset-view();
     callback toggle-measurements();
     callback toggle-volume-preview();
+    callback quad-viewport-mouse-down(int, float, float, float, float, int);
+    callback quad-viewport-mouse-move(int, float, float, float, float);
+    callback quad-viewport-mouse-up(int, float, float, float, float);
+    callback quad-viewport-scroll(int, float);
 
     viewer-focus := FocusScope {
         width: parent.width;
@@ -183,6 +404,11 @@ export component StudyViewerWindow inherits Window {
                     active: lut-label != "Gray";
                     clicked => { root.cycle-lut(); }
                 }
+                ToolbarButton {
+                    label: layout-label;
+                    active: quad-view-active;
+                    clicked => { root.toggle-layout(); }
+                }
 
                 Rectangle { width: 1px; height: 28px; background: Theme.border; }
 
@@ -212,6 +438,16 @@ export component StudyViewerWindow inherits Window {
                     label: "Meas";
                     active: measurement-panel-visible;
                     clicked => { root.toggle-measurements(); }
+                }
+                ToolbarButton {
+                    label: advanced-preview-label;
+                    active: volume-preview-active;
+                    clicked => { root.cycle-advanced-preview-mode(); }
+                }
+                ToolbarButton {
+                    label: volume-mode-label;
+                    active: volume-preview-active || volume-mode-label != "Comp";
+                    clicked => { root.cycle-volume-mode(); }
                 }
                 ToolbarButton {
                     label: "DVR";
@@ -313,173 +549,315 @@ export component StudyViewerWindow inherits Window {
                     changed width => { root.viewport-resized(self.width / 1px, self.height / 1px); }
                     changed height => { root.viewport-resized(self.width / 1px, self.height / 1px); }
 
-                    viewport-touch := TouchArea {
-                        clicked => { viewer-focus.focus(); }
-                        pointer-event(event) => {
-                            if (event.kind == PointerEventKind.down) {
-                                viewer-focus.focus();
-                                if (event.button == PointerEventButton.right) {
-                                    root.viewport-mouse-down(self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px, 2);
-                                } else {
-                                    root.viewport-mouse-down(self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px, 0);
-                                }
-                            } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
-                                root.viewport-mouse-up(self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px);
-                            }
-                        }
-                        moved => {
-                            root.viewport-mouse-move(self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px);
-                        }
-                        scroll-event(event) => {
-                            root.viewport-scroll(event.delta-y / 1px);
-                            return accept;
-                        }
-                    }
-
-                    Image {
-                        x: (parent.width - self.width) / 2 + root.viewport-offset-x * 1px;
-                        y: (parent.height - self.height) / 2 + root.viewport-offset-y * 1px;
-                        width: parent.width * root.viewport-scale;
-                        height: parent.height * root.viewport-scale;
-                        source: root.viewport-image;
-                        image-fit: contain;
-                    }
-
-                    for overlay[idx] in measurement-overlays: Path {
+                    if quad-view-active && volume-preview-active: Rectangle {
                         x: 0px;
                         y: 0px;
                         width: parent.width;
                         height: parent.height;
-                        viewbox-x: 0;
-                        viewbox-y: 0;
-                        viewbox-width: parent.width / 1px;
-                        viewbox-height: parent.height / 1px;
-                        commands: overlay.commands;
-                        fill: transparent;
-                        stroke: overlay.selected ? Theme.accent-hover : (overlay.draft ? #D9A03CAA : Theme.accent-gold);
-                        stroke-width: overlay.draft ? 1px : 2px;
-                        stroke-line-cap: round;
-                    }
+                        background: #000000;
 
-                    for overlay[idx] in measurement-overlays: Text {
-                        x: overlay.label-x * 1px;
-                        y: overlay.label-y * 1px;
-                        text: overlay.label;
-                        color: overlay.selected ? Theme.accent-hover : Theme.accent-gold;
-                        font-size: Theme.font-xs;
-                    }
+                        quad-axial := QuadViewportTile {
+                            x: 0px;
+                            y: 0px;
+                            width: parent.width / 2;
+                            height: parent.height / 2;
+                            viewport-image: root.quad-axial-image;
+                            title: "Axial";
+                            info: root.quad-axial-info;
+                            active: root.focused-quad-viewport == 0;
+                            tile-index: 0;
+                            reference-lines: root.quad-axial-reference-lines;
+                            orientation-top: root.quad-axial-orientation-top;
+                            orientation-bottom: root.quad-axial-orientation-bottom;
+                            orientation-left: root.quad-axial-orientation-left;
+                            orientation-right: root.quad-axial-orientation-right;
+                            crosshair-x: root.quad-axial-crosshair-x;
+                            crosshair-y: root.quad-axial-crosshair-y;
+                            crosshair-visible: root.quad-axial-crosshair-visible;
+                            crosshair-active: root.quad-axial-crosshair-active;
+                            mouse-down(index, x, y, w, h, button) => {
+                                viewer-focus.focus();
+                                root.quad-viewport-mouse-down(index, x, y, w, h, button);
+                            }
+                            mouse-move(index, x, y, w, h) => {
+                                root.quad-viewport-mouse-move(index, x, y, w, h);
+                            }
+                            mouse-up(index, x, y, w, h) => {
+                                root.quad-viewport-mouse-up(index, x, y, w, h);
+                            }
+                            scroll(index, delta) => {
+                                root.quad-viewport-scroll(index, delta);
+                            }
+                        }
 
-                    // Handles for selected measurements (large)
-                    for overlay[idx] in measurement-overlays: Rectangle {
-                        visible: overlay.handle-count >= 1 && (overlay.selected || overlay.draft);
-                        x: overlay.h1-x * 1px - 4px;
-                        y: overlay.h1-y * 1px - 4px;
-                        width: 8px;
-                        height: 8px;
-                        border-radius: 4px;
-                        background: overlay.draft ? #D9A03CAA : Theme.accent-hover;
-                    }
-                    for overlay[idx] in measurement-overlays: Rectangle {
-                        visible: overlay.handle-count >= 2 && (overlay.selected || overlay.draft);
-                        x: overlay.h2-x * 1px - 4px;
-                        y: overlay.h2-y * 1px - 4px;
-                        width: 8px;
-                        height: 8px;
-                        border-radius: 4px;
-                        background: overlay.draft ? #D9A03CAA : Theme.accent-hover;
-                    }
-                    for overlay[idx] in measurement-overlays: Rectangle {
-                        visible: overlay.handle-count >= 3 && (overlay.selected || overlay.draft);
-                        x: overlay.h3-x * 1px - 4px;
-                        y: overlay.h3-y * 1px - 4px;
-                        width: 8px;
-                        height: 8px;
-                        border-radius: 4px;
-                        background: overlay.draft ? #D9A03CAA : Theme.accent-hover;
-                    }
-                    for overlay[idx] in measurement-overlays: Rectangle {
-                        visible: overlay.handle-count >= 4 && (overlay.selected || overlay.draft);
-                        x: overlay.h4-x * 1px - 4px;
-                        y: overlay.h4-y * 1px - 4px;
-                        width: 8px;
-                        height: 8px;
-                        border-radius: 4px;
-                        background: overlay.draft ? #D9A03CAA : Theme.accent-hover;
-                    }
+                        quad-coronal := QuadViewportTile {
+                            x: parent.width / 2;
+                            y: 0px;
+                            width: parent.width - quad-axial.width;
+                            height: parent.height / 2;
+                            viewport-image: root.quad-coronal-image;
+                            title: "Coronal";
+                            info: root.quad-coronal-info;
+                            active: root.focused-quad-viewport == 1;
+                            tile-index: 1;
+                            reference-lines: root.quad-coronal-reference-lines;
+                            orientation-top: root.quad-coronal-orientation-top;
+                            orientation-bottom: root.quad-coronal-orientation-bottom;
+                            orientation-left: root.quad-coronal-orientation-left;
+                            orientation-right: root.quad-coronal-orientation-right;
+                            crosshair-x: root.quad-coronal-crosshair-x;
+                            crosshair-y: root.quad-coronal-crosshair-y;
+                            crosshair-visible: root.quad-coronal-crosshair-visible;
+                            crosshair-active: root.quad-coronal-crosshair-active;
+                            mouse-down(index, x, y, w, h, button) => {
+                                viewer-focus.focus();
+                                root.quad-viewport-mouse-down(index, x, y, w, h, button);
+                            }
+                            mouse-move(index, x, y, w, h) => {
+                                root.quad-viewport-mouse-move(index, x, y, w, h);
+                            }
+                            mouse-up(index, x, y, w, h) => {
+                                root.quad-viewport-mouse-up(index, x, y, w, h);
+                            }
+                            scroll(index, delta) => {
+                                root.quad-viewport-scroll(index, delta);
+                            }
+                        }
 
-                    Text {
-                        x: 12px;
-                        y: 8px;
-                        text: root.patient-name;
-                        color: #F0F0F5CC;
-                        font-size: Theme.font-sm;
-                    }
-                    Text {
-                        x: (parent.width - self.width) / 2;
-                        y: 8px;
-                        text: root.orientation-top;
-                        color: #F0F0F5CC;
-                        font-size: Theme.font-sm;
-                        font-weight: 600;
-                    }
+                        quad-sagittal := QuadViewportTile {
+                            x: 0px;
+                            y: parent.height / 2;
+                            width: parent.width / 2;
+                            height: parent.height - quad-axial.height;
+                            viewport-image: root.quad-sagittal-image;
+                            title: "Sagittal";
+                            info: root.quad-sagittal-info;
+                            active: root.focused-quad-viewport == 2;
+                            tile-index: 2;
+                            reference-lines: root.quad-sagittal-reference-lines;
+                            orientation-top: root.quad-sagittal-orientation-top;
+                            orientation-bottom: root.quad-sagittal-orientation-bottom;
+                            orientation-left: root.quad-sagittal-orientation-left;
+                            orientation-right: root.quad-sagittal-orientation-right;
+                            crosshair-x: root.quad-sagittal-crosshair-x;
+                            crosshair-y: root.quad-sagittal-crosshair-y;
+                            crosshair-visible: root.quad-sagittal-crosshair-visible;
+                            crosshair-active: root.quad-sagittal-crosshair-active;
+                            mouse-down(index, x, y, w, h, button) => {
+                                viewer-focus.focus();
+                                root.quad-viewport-mouse-down(index, x, y, w, h, button);
+                            }
+                            mouse-move(index, x, y, w, h) => {
+                                root.quad-viewport-mouse-move(index, x, y, w, h);
+                            }
+                            mouse-up(index, x, y, w, h) => {
+                                root.quad-viewport-mouse-up(index, x, y, w, h);
+                            }
+                            scroll(index, delta) => {
+                                root.quad-viewport-scroll(index, delta);
+                            }
+                        }
 
-                    Text {
-                        x: 12px;
-                        y: 24px;
-                        text: root.study-description;
-                        color: #F0F0F599;
-                        font-size: Theme.font-xs;
+                        quad-dvr := QuadViewportTile {
+                            x: parent.width / 2;
+                            y: parent.height / 2;
+                            width: parent.width - quad-sagittal.width;
+                            height: parent.height - quad-coronal.height;
+                            viewport-image: root.quad-dvr-image;
+                            title: "DVR";
+                            info: root.quad-dvr-info;
+                            active: root.focused-quad-viewport == 3;
+                            tile-index: 3;
+                            mouse-down(index, x, y, w, h, button) => {
+                                viewer-focus.focus();
+                                root.quad-viewport-mouse-down(index, x, y, w, h, button);
+                            }
+                            mouse-move(index, x, y, w, h) => {
+                                root.quad-viewport-mouse-move(index, x, y, w, h);
+                            }
+                            mouse-up(index, x, y, w, h) => {
+                                root.quad-viewport-mouse-up(index, x, y, w, h);
+                            }
+                            scroll(index, delta) => {
+                                root.quad-viewport-scroll(index, delta);
+                            }
+                        }
                     }
+                    if !quad-view-active || !volume-preview-active: Rectangle {
+                        x: 0px;
+                        y: 0px;
+                        width: parent.width;
+                        height: parent.height;
+                        background: transparent;
 
-                    Text {
-                        x: 12px;
-                        y: (parent.height - self.height) / 2;
-                        text: root.orientation-left;
-                        color: #F0F0F5CC;
-                        font-size: Theme.font-sm;
-                        font-weight: 600;
-                    }
+                        viewport-touch := TouchArea {
+                            clicked => { viewer-focus.focus(); }
+                            pointer-event(event) => {
+                                if (event.kind == PointerEventKind.down) {
+                                    viewer-focus.focus();
+                                    if (event.button == PointerEventButton.right) {
+                                        root.viewport-mouse-down(self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px, 2);
+                                    } else {
+                                        root.viewport-mouse-down(self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px, 0);
+                                    }
+                                } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                                    root.viewport-mouse-up(self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px);
+                                }
+                            }
+                            moved => {
+                                root.viewport-mouse-move(self.mouse-x / 1px, self.mouse-y / 1px, parent.width / 1px, parent.height / 1px);
+                            }
+                            scroll-event(event) => {
+                                root.viewport-scroll(event.delta-y / 1px);
+                                return accept;
+                            }
+                        }
 
-                    Text {
-                        x: parent.width - self.width - 12px;
-                        y: (parent.height - self.height) / 2;
-                        text: root.orientation-right;
-                        color: #F0F0F5CC;
-                        font-size: Theme.font-sm;
-                        font-weight: 600;
-                    }
+                        Image {
+                            x: (parent.width - self.width) / 2 + root.viewport-offset-x * 1px;
+                            y: (parent.height - self.height) / 2 + root.viewport-offset-y * 1px;
+                            width: parent.width * root.viewport-scale;
+                            height: parent.height * root.viewport-scale;
+                            source: root.viewport-image;
+                            image-fit: contain;
+                        }
 
-                    Text {
-                        x: 12px;
-                        y: parent.height - 36px;
-                        text: root.window-info;
-                        color: #F0F0F5CC;
-                        font-size: Theme.font-xs;
-                    }
+                        for overlay[idx] in measurement-overlays: Path {
+                            x: 0px;
+                            y: 0px;
+                            width: parent.width;
+                            height: parent.height;
+                            viewbox-x: 0;
+                            viewbox-y: 0;
+                            viewbox-width: parent.width / 1px;
+                            viewbox-height: parent.height / 1px;
+                            commands: overlay.commands;
+                            fill: transparent;
+                            stroke: overlay.selected ? Theme.accent-hover : (overlay.draft ? #D9A03CAA : Theme.accent-gold);
+                            stroke-width: overlay.draft ? 1px : 2px;
+                            stroke-line-cap: round;
+                        }
 
-                    Text {
-                        x: (parent.width - self.width) / 2;
-                        y: parent.height - 36px;
-                        text: root.orientation-bottom;
-                        color: #F0F0F5CC;
-                        font-size: Theme.font-sm;
-                        font-weight: 600;
-                    }
+                        for overlay[idx] in measurement-overlays: Text {
+                            x: overlay.label-x * 1px;
+                            y: overlay.label-y * 1px;
+                            text: overlay.label;
+                            color: overlay.selected ? Theme.accent-hover : Theme.accent-gold;
+                            font-size: Theme.font-xs;
+                        }
 
-                    Text {
-                        x: parent.width - 100px;
-                        y: parent.height - 36px;
-                        text: root.slice-info;
-                        color: #F0F0F5CC;
-                        font-size: Theme.font-xs;
-                    }
+                        // Handles for selected measurements (large)
+                        for overlay[idx] in measurement-overlays: Rectangle {
+                            visible: overlay.handle-count >= 1 && (overlay.selected || overlay.draft);
+                            x: overlay.h1-x * 1px - 4px;
+                            y: overlay.h1-y * 1px - 4px;
+                            width: 8px;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: overlay.draft ? #D9A03CAA : Theme.accent-hover;
+                        }
+                        for overlay[idx] in measurement-overlays: Rectangle {
+                            visible: overlay.handle-count >= 2 && (overlay.selected || overlay.draft);
+                            x: overlay.h2-x * 1px - 4px;
+                            y: overlay.h2-y * 1px - 4px;
+                            width: 8px;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: overlay.draft ? #D9A03CAA : Theme.accent-hover;
+                        }
+                        for overlay[idx] in measurement-overlays: Rectangle {
+                            visible: overlay.handle-count >= 3 && (overlay.selected || overlay.draft);
+                            x: overlay.h3-x * 1px - 4px;
+                            y: overlay.h3-y * 1px - 4px;
+                            width: 8px;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: overlay.draft ? #D9A03CAA : Theme.accent-hover;
+                        }
+                        for overlay[idx] in measurement-overlays: Rectangle {
+                            visible: overlay.handle-count >= 4 && (overlay.selected || overlay.draft);
+                            x: overlay.h4-x * 1px - 4px;
+                            y: overlay.h4-y * 1px - 4px;
+                            width: 8px;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: overlay.draft ? #D9A03CAA : Theme.accent-hover;
+                        }
 
-                    Text {
-                        x: 12px;
-                        y: parent.height - 52px;
-                        text: root.zoom-info;
-                        color: #F0F0F599;
-                        font-size: Theme.font-xs;
+                        Text {
+                            x: 12px;
+                            y: 8px;
+                            text: root.patient-name;
+                            color: #F0F0F5CC;
+                            font-size: Theme.font-sm;
+                        }
+                        Text {
+                            x: (parent.width - self.width) / 2;
+                            y: 8px;
+                            text: root.orientation-top;
+                            color: #F0F0F5CC;
+                            font-size: Theme.font-sm;
+                            font-weight: 600;
+                        }
+
+                        Text {
+                            x: 12px;
+                            y: 24px;
+                            text: root.study-description;
+                            color: #F0F0F599;
+                            font-size: Theme.font-xs;
+                        }
+
+                        Text {
+                            x: 12px;
+                            y: (parent.height - self.height) / 2;
+                            text: root.orientation-left;
+                            color: #F0F0F5CC;
+                            font-size: Theme.font-sm;
+                            font-weight: 600;
+                        }
+
+                        Text {
+                            x: parent.width - self.width - 12px;
+                            y: (parent.height - self.height) / 2;
+                            text: root.orientation-right;
+                            color: #F0F0F5CC;
+                            font-size: Theme.font-sm;
+                            font-weight: 600;
+                        }
+
+                        Text {
+                            x: 12px;
+                            y: parent.height - 36px;
+                            text: root.window-info;
+                            color: #F0F0F5CC;
+                            font-size: Theme.font-xs;
+                        }
+
+                        Text {
+                            x: (parent.width - self.width) / 2;
+                            y: parent.height - 36px;
+                            text: root.orientation-bottom;
+                            color: #F0F0F5CC;
+                            font-size: Theme.font-sm;
+                            font-weight: 600;
+                        }
+
+                        Text {
+                            x: parent.width - 100px;
+                            y: parent.height - 36px;
+                            text: root.slice-info;
+                            color: #F0F0F5CC;
+                            font-size: Theme.font-xs;
+                        }
+
+                        Text {
+                            x: 12px;
+                            y: parent.height - 52px;
+                            text: root.zoom-info;
+                            color: #F0F0F599;
+                            font-size: Theme.font-xs;
+                        }
                     }
                 }
 

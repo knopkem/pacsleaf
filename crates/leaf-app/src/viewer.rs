@@ -4,7 +4,7 @@ use crate::browser::{
     apply_window_geometry, capture_window_geometry, load_window_geometry, save_window_geometry,
     VIEWER_WINDOW_GEOMETRY_KEY,
 };
-use glam::DVec2;
+use glam::{DQuat, DVec2, DVec3};
 use leaf_core::domain::{InstanceInfo, SeriesInfo, SeriesUid, StudyUid};
 use leaf_core::error::{LeafError, LeafResult};
 use leaf_db::imagebox::Imagebox;
@@ -12,7 +12,9 @@ use leaf_dicom::metadata::read_instance_geometry;
 use leaf_dicom::overlay::{load_overlays, OverlayBitmap};
 use leaf_dicom::pixel::{decode_frame_with_window, frame_count};
 use leaf_render::{
-    lut::ColorLut, PreparedVolume, VolumePreviewImage, VolumePreviewRenderer, VolumeViewState,
+    lut::ColorLut, PreparedVolume, SlicePlane, SlicePreviewMode, SlicePreviewState,
+    SliceProjectionMode, VolumeBlendMode, VolumePreviewImage, VolumePreviewRenderer,
+    VolumeViewState,
 };
 use leaf_tools::measurement::{Measurement, MeasurementKind, MeasurementValue};
 use lru::LruCache;
@@ -49,6 +51,9 @@ struct ViewerSession {
     active_frame_index: usize,
     measurement_panel_visible: bool,
     volume_preview_active: bool,
+    quad_viewport_active: bool,
+    advanced_preview_mode: AdvancedPreviewMode,
+    focused_quad_viewport: QuadViewportKind,
     active_tool: leaf_ui::ViewerTool,
     viewport_scale: f32,
     viewport_offset_x: f32,
@@ -74,6 +79,11 @@ struct ViewerSession {
     volume_renderer: Option<VolumePreviewRenderer>,
     prepared_volumes_by_series: HashMap<String, PreparedVolume>,
     volume_view_state_by_series: HashMap<String, VolumeViewState>,
+    slice_view_state_by_series: HashMap<String, SlicePreviewState>,
+    quad_previews_by_kind: HashMap<QuadViewportKind, AdvancedViewportPreview>,
+    quad_reference_lines_by_kind: HashMap<QuadViewportKind, Vec<QuadReferenceLineOverlay>>,
+    quad_reference_hover: Option<QuadReferenceSelection>,
+    quad_reference_drag: Option<QuadReferenceDrag>,
 }
 
 #[derive(Clone)]
@@ -114,6 +124,178 @@ impl ImageTransformState {
     fn is_rotated(self) -> bool {
         self.rotation_quarters % 4 != 0
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum AdvancedPreviewMode {
+    #[default]
+    Dvr,
+    Axial,
+    Coronal,
+    Sagittal,
+}
+
+impl AdvancedPreviewMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Dvr => "DVR",
+            Self::Axial => "Ax",
+            Self::Coronal => "Co",
+            Self::Sagittal => "Sa",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Dvr => Self::Axial,
+            Self::Axial => Self::Coronal,
+            Self::Coronal => Self::Sagittal,
+            Self::Sagittal => Self::Dvr,
+        }
+    }
+
+    fn slice_mode(self) -> Option<SlicePreviewMode> {
+        match self {
+            Self::Dvr => None,
+            Self::Axial => Some(SlicePreviewMode::Axial),
+            Self::Coronal => Some(SlicePreviewMode::Coronal),
+            Self::Sagittal => Some(SlicePreviewMode::Sagittal),
+        }
+    }
+
+    fn is_dvr(self) -> bool {
+        matches!(self, Self::Dvr)
+    }
+
+    fn quad_viewport(self) -> QuadViewportKind {
+        match self {
+            Self::Axial => QuadViewportKind::Axial,
+            Self::Coronal => QuadViewportKind::Coronal,
+            Self::Sagittal => QuadViewportKind::Sagittal,
+            Self::Dvr => QuadViewportKind::Dvr,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum QuadViewportKind {
+    Axial,
+    Coronal,
+    Sagittal,
+    Dvr,
+}
+
+impl QuadViewportKind {
+    const ALL: [Self; 4] = [Self::Axial, Self::Coronal, Self::Sagittal, Self::Dvr];
+
+    fn from_index(index: i32) -> Option<Self> {
+        match index {
+            0 => Some(Self::Axial),
+            1 => Some(Self::Coronal),
+            2 => Some(Self::Sagittal),
+            3 => Some(Self::Dvr),
+            _ => None,
+        }
+    }
+
+    fn index(self) -> i32 {
+        match self {
+            Self::Axial => 0,
+            Self::Coronal => 1,
+            Self::Sagittal => 2,
+            Self::Dvr => 3,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Axial => "Axial",
+            Self::Coronal => "Coronal",
+            Self::Sagittal => "Sagittal",
+            Self::Dvr => "DVR",
+        }
+    }
+
+    fn advanced_preview_mode(self) -> AdvancedPreviewMode {
+        match self {
+            Self::Axial => AdvancedPreviewMode::Axial,
+            Self::Coronal => AdvancedPreviewMode::Coronal,
+            Self::Sagittal => AdvancedPreviewMode::Sagittal,
+            Self::Dvr => AdvancedPreviewMode::Dvr,
+        }
+    }
+
+    fn slice_mode(self) -> Option<SlicePreviewMode> {
+        self.advanced_preview_mode().slice_mode()
+    }
+
+    fn is_dvr(self) -> bool {
+        matches!(self, Self::Dvr)
+    }
+
+    fn linked_mpr_views(self) -> [Self; 2] {
+        match self {
+            Self::Axial => [Self::Coronal, Self::Sagittal],
+            Self::Coronal => [Self::Axial, Self::Sagittal],
+            Self::Sagittal => [Self::Axial, Self::Coronal],
+            Self::Dvr => [Self::Axial, Self::Coronal],
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AdvancedViewportPreview {
+    width: u32,
+    height: u32,
+    image: slint::Image,
+    info: String,
+}
+
+#[derive(Clone)]
+struct QuadReferenceLineOverlay {
+    commands: String,
+    start_x: f32,
+    start_y: f32,
+    end_x: f32,
+    end_y: f32,
+    handle1_x: f32,
+    handle1_y: f32,
+    handle2_x: f32,
+    handle2_y: f32,
+    source_kind: QuadViewportKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuadReferenceTarget {
+    Center,
+    TranslateLine(QuadViewportKind),
+    RotateLine(QuadViewportKind),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct QuadReferenceSelection {
+    view: QuadViewportKind,
+    target: QuadReferenceTarget,
+}
+
+#[derive(Clone, Copy)]
+enum QuadReferenceDrag {
+    Center {
+        view: QuadViewportKind,
+    },
+    TranslateLine {
+        view: QuadViewportKind,
+        line_kind: QuadViewportKind,
+        start_crosshair_world: DVec3,
+        start_pointer_world: DVec3,
+        line_normal: DVec3,
+    },
+    RotateLine {
+        view: QuadViewportKind,
+        line_kind: QuadViewportKind,
+        start_angle_rad: f64,
+        start_orientation: DQuat,
+    },
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -249,6 +431,9 @@ pub(crate) fn open_viewer_for_study(
     viewer.set_connection_status("Local imagebox".into());
     viewer.set_active_tool(leaf_ui::ViewerTool::WindowLevel);
     viewer.set_volume_preview_active(false);
+    viewer.set_quad_view_active(false);
+    viewer.set_layout_label("1Up".into());
+    viewer.set_focused_quad_viewport(AdvancedPreviewMode::default().quad_viewport().index());
     viewer.set_study_description(
         study
             .study_description
@@ -275,6 +460,9 @@ pub(crate) fn open_viewer_for_study(
         active_frame_index: 0,
         measurement_panel_visible: false,
         volume_preview_active: false,
+        quad_viewport_active: false,
+        advanced_preview_mode: AdvancedPreviewMode::default(),
+        focused_quad_viewport: AdvancedPreviewMode::default().quad_viewport(),
         active_tool: leaf_ui::ViewerTool::WindowLevel,
         viewport_scale: 1.0,
         viewport_offset_x: 0.0,
@@ -302,6 +490,11 @@ pub(crate) fn open_viewer_for_study(
         volume_renderer: None,
         prepared_volumes_by_series: HashMap::new(),
         volume_view_state_by_series: HashMap::new(),
+        slice_view_state_by_series: HashMap::new(),
+        quad_previews_by_kind: HashMap::new(),
+        quad_reference_lines_by_kind: HashMap::new(),
+        quad_reference_hover: None,
+        quad_reference_drag: None,
     }));
 
     {
@@ -327,6 +520,7 @@ pub(crate) fn open_viewer_for_study(
         session.selected_measurement_id = None;
         session.draft_measurement = None;
         session.handle_drag = None;
+        session.quad_reference_drag = None;
         reset_viewport_state(&mut session, true);
         let result = update_series_model(&session).and_then(|_| {
             if preview_active {
@@ -351,6 +545,7 @@ pub(crate) fn open_viewer_for_study(
         session.volume_drag_state = None;
         session.draft_measurement = None;
         session.handle_drag = None;
+        session.quad_reference_drag = None;
         // Only rebuild measurement overlays when a draft measurement was cleared;
         // otherwise the overlays haven't changed and the Slint model rebuild is
         // pure overhead.
@@ -428,16 +623,59 @@ pub(crate) fn open_viewer_for_study(
     viewer.on_viewport_scroll(move |delta| {
         let mut session = session_for_scroll.borrow_mut();
         if session.volume_preview_active {
-            let zoom_factor = if delta > 0.0 {
-                1.1
-            } else if delta < 0.0 {
-                0.9
-            } else {
-                1.0
-            };
-            active_volume_view_state(&mut session).zoom_by(zoom_factor);
+            if session.quad_viewport_active {
+                let focused_quad_viewport = session.focused_quad_viewport;
+                let result = if session.focused_quad_viewport.is_dvr() {
+                    let zoom_factor = if delta > 0.0 {
+                        1.1
+                    } else if delta < 0.0 {
+                        0.9
+                    } else {
+                        1.0
+                    };
+                    active_volume_view_state(&mut session).zoom_by(zoom_factor);
+                    render_quad_single_preview(&mut session, QuadViewportKind::Dvr, false)
+                } else {
+                    adjust_quad_crosshair_by_scroll(&mut session, focused_quad_viewport, delta)
+                        .and_then(|_| render_quad_mpr_previews(&mut session))
+                };
+                if let Err(error) = result {
+                    info!("Failed to update quad viewport scroll: {}", error);
+                }
+                return;
+            }
+            if session.advanced_preview_mode.is_dvr() {
+                let zoom_factor = if delta > 0.0 {
+                    1.1
+                } else if delta < 0.0 {
+                    0.9
+                } else {
+                    1.0
+                };
+                active_volume_view_state(&mut session).zoom_by(zoom_factor);
+            } else if let Some(slice_mode) = session.advanced_preview_mode.slice_mode() {
+                let bounds_and_step = session
+                    .prepared_volumes_by_series
+                    .get(&session.active_series_uid)
+                    .map(|prepared| {
+                        (
+                            prepared.world_bounds(),
+                            prepared.slice_scroll_step(slice_mode),
+                        )
+                    });
+                if let Some((bounds, step)) = bounds_and_step {
+                    let delta_mm = if delta < 0.0 {
+                        step
+                    } else if delta > 0.0 {
+                        -step
+                    } else {
+                        0.0
+                    };
+                    active_slice_view_state(&mut session).scroll_by(delta_mm, bounds);
+                }
+            }
             if let Err(error) = render_or_show_volume_preview(&mut session) {
-                info!("Failed to zoom volume preview: {}", error);
+                info!("Failed to update advanced preview: {}", error);
             }
             return;
         }
@@ -466,13 +704,52 @@ pub(crate) fn open_viewer_for_study(
         let mut session = session_for_mouse_down.borrow_mut();
         update_viewport_dimensions(&mut session, viewport_width, viewport_height);
         if session.volume_preview_active {
-            session.drag_state = None;
-            session.volume_drag_state = Some(VolumeDragState {
-                origin_x: x,
-                origin_y: y,
-                button,
-                start_view_state: *active_volume_view_state(&mut session),
-            });
+            if session.advanced_preview_mode.is_dvr() {
+                session.drag_state = None;
+                session.volume_drag_state = Some(VolumeDragState {
+                    origin_x: x,
+                    origin_y: y,
+                    button,
+                    start_view_state: *active_volume_view_state(&mut session),
+                });
+            } else {
+                session.volume_drag_state = None;
+                if button == 2 {
+                    session.drag_state = None;
+                    if let Some(world) = mpr_world_point_from_viewport(&session, x, y) {
+                        active_slice_view_state(&mut session).set_crosshair_world(world);
+                        if let Err(error) = render_or_show_volume_preview(&mut session) {
+                            info!("Failed to update MPR crosshair: {}", error);
+                        }
+                    }
+                    return;
+                }
+                let scalar_range = session
+                    .prepared_volumes_by_series
+                    .get(&session.active_series_uid)
+                    .map(|prepared| prepared.scalar_range());
+                session.drag_state = match (session.active_tool, scalar_range) {
+                    (
+                        leaf_ui::ViewerTool::WindowLevel
+                        | leaf_ui::ViewerTool::Pan
+                        | leaf_ui::ViewerTool::Zoom,
+                        Some((scalar_min, scalar_max)),
+                    ) => {
+                        let (start_center, start_width) = active_slice_view_state(&mut session)
+                            .transfer_window(scalar_min, scalar_max);
+                        Some(ViewportDragState {
+                            origin_x: x,
+                            origin_y: y,
+                            start_offset_x: session.viewport_offset_x,
+                            start_offset_y: session.viewport_offset_y,
+                            start_scale: session.viewport_scale,
+                            start_window_center: start_center,
+                            start_window_width: start_width,
+                        })
+                    }
+                    _ => None,
+                };
+            }
             return;
         }
         match session.active_tool {
@@ -562,9 +839,13 @@ pub(crate) fn open_viewer_for_study(
         let mut session = session_for_mouse_up.borrow_mut();
         update_viewport_dimensions(&mut session, viewport_width, viewport_height);
         if session.volume_preview_active {
-            session.volume_drag_state = None;
-            if let Err(error) = render_volume_preview(&mut session, false) {
-                info!("Failed to finalize volume preview interaction: {}", error);
+            if session.advanced_preview_mode.is_dvr() {
+                session.volume_drag_state = None;
+                if let Err(error) = render_volume_preview(&mut session, false) {
+                    info!("Failed to finalize volume preview interaction: {}", error);
+                }
+            } else {
+                session.drag_state = None;
             }
             return;
         }
@@ -632,7 +913,7 @@ pub(crate) fn open_viewer_for_study(
     viewer.on_viewport_mouse_move(move |x, y, viewport_width, viewport_height| {
         let mut session = session_for_mouse_move.borrow_mut();
         update_viewport_dimensions(&mut session, viewport_width, viewport_height);
-        if session.volume_preview_active {
+        if session.volume_preview_active && session.advanced_preview_mode.is_dvr() {
             let Some(drag_state) = session.volume_drag_state else {
                 return;
             };
@@ -647,6 +928,49 @@ pub(crate) fn open_viewer_for_study(
             );
             if let Err(error) = render_volume_preview(&mut session, true) {
                 info!("Failed to update volume preview interaction: {}", error);
+            }
+            return;
+        }
+
+        if session.volume_preview_active {
+            let Some(drag_state) = session.drag_state else {
+                return;
+            };
+            let dx = x - drag_state.origin_x;
+            let dy = y - drag_state.origin_y;
+            let result = match session.active_tool {
+                leaf_ui::ViewerTool::Pan => {
+                    session.viewport_offset_x = drag_state.start_offset_x + dx;
+                    session.viewport_offset_y = drag_state.start_offset_y + dy;
+                    apply_viewport_state(&session)
+                }
+                leaf_ui::ViewerTool::Zoom => {
+                    let factor = (1.0 - dy * 0.01).max(0.1);
+                    session.viewport_scale = (drag_state.start_scale * factor).clamp(0.25, 8.0);
+                    apply_viewport_state(&session)
+                }
+                leaf_ui::ViewerTool::WindowLevel => {
+                    let scalar_range = session
+                        .prepared_volumes_by_series
+                        .get(&session.active_series_uid)
+                        .map(|prepared| prepared.scalar_range());
+                    if let Some((scalar_min, scalar_max)) = scalar_range {
+                        let sensitivity = (drag_state.start_window_width / 512.0).max(1.0);
+                        let center = drag_state.start_window_center + dx as f64 * sensitivity;
+                        let width =
+                            (drag_state.start_window_width - dy as f64 * sensitivity).max(1.0);
+                        active_slice_view_state(&mut session)
+                            .set_transfer_window(center, width, scalar_min, scalar_max);
+                        render_or_show_volume_preview(&mut session)
+                    } else {
+                        Ok(())
+                    }
+                }
+                _ => Ok(()),
+            };
+
+            if let Err(error) = result {
+                info!("Failed to update MPR interaction: {}", error);
             }
             return;
         }
@@ -727,6 +1051,421 @@ pub(crate) fn open_viewer_for_study(
         }
     });
 
+    let session_for_quad_mouse_down = session.clone();
+    viewer.on_quad_viewport_mouse_down(
+        move |index, x, y, viewport_width, viewport_height, button| {
+            let Some(kind) = QuadViewportKind::from_index(index) else {
+                return;
+            };
+            let mut session = session_for_quad_mouse_down.borrow_mut();
+            set_selected_quad_viewport(&mut session, kind);
+            session.quad_reference_drag = None;
+            session.quad_reference_hover = None;
+            if !session.volume_preview_active || !session.quad_viewport_active {
+                let _ = apply_viewport_state(&session);
+                return;
+            }
+
+            if kind.is_dvr() {
+                session.drag_state = None;
+                session.volume_drag_state = Some(VolumeDragState {
+                    origin_x: x,
+                    origin_y: y,
+                    button,
+                    start_view_state: *active_volume_view_state(&mut session),
+                });
+                let _ = apply_viewport_state(&session);
+                return;
+            }
+
+            session.volume_drag_state = None;
+            if button == 2 {
+                if let Some(world) = quad_mpr_world_point_from_viewport(
+                    &session,
+                    kind,
+                    x,
+                    y,
+                    viewport_width,
+                    viewport_height,
+                ) {
+                    let bounds = session
+                        .prepared_volumes_by_series
+                        .get(&session.active_series_uid)
+                        .map(|prepared| prepared.world_bounds());
+                    if let (Some(slice_mode), Some(bounds)) = (kind.slice_mode(), bounds) {
+                        let slice_state = active_slice_view_state(&mut session);
+                        slice_state.set_mode(slice_mode);
+                        slice_state.center_on_world(world, bounds);
+                        if let Err(error) = render_quad_mpr_previews(&mut session) {
+                            info!("Failed to update quad MPR crosshair: {}", error);
+                        }
+                    }
+                }
+                return;
+            }
+
+            if let Some(hit) =
+                quad_reference_line_hit(&session, kind, x, y, viewport_width, viewport_height)
+            {
+                session.quad_reference_hover = Some(hit);
+                session.drag_state = None;
+                match hit.target {
+                    QuadReferenceTarget::Center => {
+                        session.quad_reference_drag =
+                            Some(QuadReferenceDrag::Center { view: kind });
+                        let _ = apply_viewport_state(&session);
+                        return;
+                    }
+                    QuadReferenceTarget::RotateLine(line_kind) => {
+                        if let Some(start_angle_rad) = quad_mpr_angle_from_viewport(
+                            &session,
+                            kind,
+                            x,
+                            y,
+                            viewport_width,
+                            viewport_height,
+                        ) {
+                            let start_orientation = session
+                                .slice_view_state_by_series
+                                .get(&session.active_series_uid)
+                                .copied()
+                                .unwrap_or_default()
+                                .orientation;
+                            session.quad_reference_drag = Some(QuadReferenceDrag::RotateLine {
+                                view: kind,
+                                line_kind,
+                                start_angle_rad,
+                                start_orientation,
+                            });
+                            let _ = apply_viewport_state(&session);
+                            return;
+                        }
+                    }
+                    QuadReferenceTarget::TranslateLine(line_kind) => {
+                        let drag = session
+                            .prepared_volumes_by_series
+                            .get(&session.active_series_uid)
+                            .and_then(|prepared| {
+                                let bounds = prepared.world_bounds();
+                                let current_state =
+                                    quad_slice_view_state_for_kind(&session, prepared, kind)?;
+                                let other_state =
+                                    quad_slice_view_state_for_kind(&session, prepared, line_kind)?;
+                                let start_pointer_world = quad_mpr_world_point_from_viewport(
+                                    &session,
+                                    kind,
+                                    x,
+                                    y,
+                                    viewport_width,
+                                    viewport_height,
+                                )?;
+                                let start_crosshair_world = current_state.crosshair_world(bounds);
+                                let current_plane = current_state.slice_plane(bounds);
+                                let other_plane = other_state.slice_plane(bounds);
+                                let line_dir = current_plane.normal().cross(other_plane.normal());
+                                if line_dir.length_squared() <= 1.0e-10 {
+                                    return None;
+                                }
+                                let line_normal =
+                                    current_plane.normal().cross(line_dir.normalize());
+                                if line_normal.length_squared() <= 1.0e-10 {
+                                    return None;
+                                }
+                                Some(QuadReferenceDrag::TranslateLine {
+                                    view: kind,
+                                    line_kind,
+                                    start_crosshair_world,
+                                    start_pointer_world,
+                                    line_normal: line_normal.normalize(),
+                                })
+                            });
+                        if let Some(drag) = drag {
+                            session.quad_reference_drag = Some(drag);
+                            let _ = apply_viewport_state(&session);
+                            return;
+                        }
+                    }
+                }
+            }
+            if session.quad_reference_hover.is_some() {
+                session.quad_reference_hover = None;
+                let _ = apply_viewport_state(&session);
+            }
+
+            let scalar_range = session
+                .prepared_volumes_by_series
+                .get(&session.active_series_uid)
+                .map(|prepared| prepared.scalar_range());
+            session.drag_state = match (session.active_tool, scalar_range) {
+                (leaf_ui::ViewerTool::WindowLevel, Some((scalar_min, scalar_max))) => {
+                    let slice_mode = kind.slice_mode().unwrap_or_default();
+                    let bounds = session
+                        .prepared_volumes_by_series
+                        .get(&session.active_series_uid)
+                        .map(|prepared| prepared.world_bounds());
+                    let slice_state = active_slice_view_state(&mut session);
+                    if slice_state.mode != slice_mode {
+                        slice_state.set_mode(slice_mode);
+                    }
+                    if let Some(bounds) = bounds {
+                        slice_state.center_on_crosshair(bounds);
+                    }
+                    let (start_center, start_width) =
+                        slice_state.transfer_window(scalar_min, scalar_max);
+                    Some(ViewportDragState {
+                        origin_x: x,
+                        origin_y: y,
+                        start_offset_x: 0.0,
+                        start_offset_y: 0.0,
+                        start_scale: 1.0,
+                        start_window_center: start_center,
+                        start_window_width: start_width,
+                    })
+                }
+                _ => None,
+            };
+            let _ = apply_viewport_state(&session);
+        },
+    );
+
+    let session_for_quad_mouse_up = session.clone();
+    viewer.on_quad_viewport_mouse_up(move |index, x, y, viewport_width, viewport_height| {
+        let Some(kind) = QuadViewportKind::from_index(index) else {
+            return;
+        };
+        let mut session = session_for_quad_mouse_up.borrow_mut();
+        set_selected_quad_viewport(&mut session, kind);
+        if !session.volume_preview_active || !session.quad_viewport_active {
+            return;
+        }
+        session.quad_reference_drag = None;
+        session.quad_reference_hover = if kind.is_dvr() {
+            None
+        } else {
+            quad_reference_line_hit(&session, kind, x, y, viewport_width, viewport_height)
+        };
+        if kind.is_dvr() {
+            session.volume_drag_state = None;
+            if let Err(error) =
+                render_quad_single_preview(&mut session, QuadViewportKind::Dvr, false)
+            {
+                info!("Failed to finalize quad DVR interaction: {}", error);
+            }
+        } else {
+            session.drag_state = None;
+        }
+    });
+
+    let session_for_quad_mouse_move = session.clone();
+    viewer.on_quad_viewport_mouse_move(move |index, x, y, viewport_width, viewport_height| {
+        let Some(kind) = QuadViewportKind::from_index(index) else {
+            return;
+        };
+        let mut session = session_for_quad_mouse_move.borrow_mut();
+        if !session.volume_preview_active || !session.quad_viewport_active {
+            return;
+        }
+
+        if kind.is_dvr() {
+            let Some(drag_state) = session.volume_drag_state else {
+                return;
+            };
+            let dx = x - drag_state.origin_x;
+            let dy = y - drag_state.origin_y;
+            apply_volume_drag(
+                &mut session,
+                drag_state.start_view_state,
+                dx,
+                dy,
+                drag_state.button,
+            );
+            if let Err(error) =
+                render_quad_single_preview(&mut session, QuadViewportKind::Dvr, true)
+            {
+                info!("Failed to update quad DVR interaction: {}", error);
+            }
+            return;
+        }
+
+        if let Some(reference_drag) = session.quad_reference_drag {
+            let result = match reference_drag {
+                QuadReferenceDrag::Center { view } => {
+                    if view != kind {
+                        return;
+                    }
+                    if let Some(world) = quad_mpr_world_point_from_viewport(
+                        &session,
+                        kind,
+                        x,
+                        y,
+                        viewport_width,
+                        viewport_height,
+                    ) {
+                        let bounds = session
+                            .prepared_volumes_by_series
+                            .get(&session.active_series_uid)
+                            .map(|prepared| prepared.world_bounds());
+                        if let (Some(slice_mode), Some(bounds)) = (kind.slice_mode(), bounds) {
+                            let slice_state = active_slice_view_state(&mut session);
+                            if slice_state.mode != slice_mode {
+                                slice_state.set_mode(slice_mode);
+                            }
+                            slice_state.center_on_world(world, bounds);
+                            render_quad_mpr_previews(&mut session)
+                        } else {
+                            Ok(())
+                        }
+                    } else {
+                        Ok(())
+                    }
+                }
+                QuadReferenceDrag::TranslateLine {
+                    view,
+                    start_crosshair_world,
+                    start_pointer_world,
+                    line_normal,
+                    ..
+                } => {
+                    if view != kind {
+                        return;
+                    }
+                    if let Some(pointer_world) = quad_mpr_world_point_from_viewport(
+                        &session,
+                        kind,
+                        x,
+                        y,
+                        viewport_width,
+                        viewport_height,
+                    ) {
+                        if let Some(slice_mode) = kind.slice_mode() {
+                            let delta = (pointer_world - start_pointer_world).dot(line_normal);
+                            let new_world = start_crosshair_world + line_normal * delta;
+                            let slice_state = active_slice_view_state(&mut session);
+                            if slice_state.mode != slice_mode {
+                                slice_state.set_mode(slice_mode);
+                            }
+                            slice_state.set_crosshair_world(new_world);
+                            render_quad_mpr_previews(&mut session)
+                        } else {
+                            Ok(())
+                        }
+                    } else {
+                        Ok(())
+                    }
+                }
+                QuadReferenceDrag::RotateLine {
+                    view,
+                    start_angle_rad,
+                    start_orientation,
+                    ..
+                } => {
+                    if view != kind {
+                        return;
+                    }
+                    quad_mpr_angle_from_viewport(
+                        &session,
+                        kind,
+                        x,
+                        y,
+                        viewport_width,
+                        viewport_height,
+                    )
+                    .map(|current_angle_rad| {
+                        let bounds = session
+                            .prepared_volumes_by_series
+                            .get(&session.active_series_uid)
+                            .map(|prepared| prepared.world_bounds());
+                        if let (Some(slice_mode), Some(bounds)) = (kind.slice_mode(), bounds) {
+                            let slice_state = active_slice_view_state(&mut session);
+                            if slice_state.mode != slice_mode {
+                                slice_state.set_mode(slice_mode);
+                            }
+                            slice_state.orientation = start_orientation;
+                            slice_state.rotate_about_normal(
+                                normalized_angle_delta(current_angle_rad, start_angle_rad),
+                                bounds,
+                            );
+                            render_quad_mpr_previews(&mut session)
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .unwrap_or(Ok(()))
+                }
+            };
+            if let Err(error) = result {
+                info!("Failed to update quad MPR cursor interaction: {}", error);
+            }
+            return;
+        }
+
+        if session.drag_state.is_none() {
+            let hovered =
+                quad_reference_line_hit(&session, kind, x, y, viewport_width, viewport_height);
+            if session.quad_reference_hover != hovered {
+                session.quad_reference_hover = hovered;
+                let _ = apply_viewport_state(&session);
+            }
+        }
+
+        let Some(drag_state) = session.drag_state else {
+            return;
+        };
+        if !matches!(session.active_tool, leaf_ui::ViewerTool::WindowLevel) {
+            return;
+        }
+        let dx = x - drag_state.origin_x;
+        let dy = y - drag_state.origin_y;
+        let scalar_range = session
+            .prepared_volumes_by_series
+            .get(&session.active_series_uid)
+            .map(|prepared| prepared.scalar_range());
+        let result = if let Some((scalar_min, scalar_max)) = scalar_range {
+            let sensitivity = (drag_state.start_window_width / 512.0).max(1.0);
+            let center = drag_state.start_window_center + dx as f64 * sensitivity;
+            let width = (drag_state.start_window_width - dy as f64 * sensitivity).max(1.0);
+            active_slice_view_state(&mut session)
+                .set_transfer_window(center, width, scalar_min, scalar_max);
+            render_quad_mpr_previews(&mut session)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            info!("Failed to update quad MPR interaction: {}", error);
+        }
+    });
+
+    let session_for_quad_scroll = session.clone();
+    viewer.on_quad_viewport_scroll(move |index, delta| {
+        let Some(kind) = QuadViewportKind::from_index(index) else {
+            return;
+        };
+        let mut session = session_for_quad_scroll.borrow_mut();
+        set_selected_quad_viewport(&mut session, kind);
+        if !session.volume_preview_active || !session.quad_viewport_active {
+            let _ = apply_viewport_state(&session);
+            return;
+        }
+
+        let result = if kind.is_dvr() {
+            let zoom_factor = if delta > 0.0 {
+                1.1
+            } else if delta < 0.0 {
+                0.9
+            } else {
+                1.0
+            };
+            active_volume_view_state(&mut session).zoom_by(zoom_factor);
+            render_quad_single_preview(&mut session, QuadViewportKind::Dvr, false)
+        } else {
+            adjust_quad_crosshair_by_scroll(&mut session, kind, delta)
+                .and_then(|_| render_quad_mpr_previews(&mut session))
+        };
+        if let Err(error) = result {
+            info!("Failed to update quad viewport scroll: {}", error);
+        }
+    });
+
     let session_for_resize = session.clone();
     viewer.on_viewport_resized(move |width, height| {
         let mut session = session_for_resize.borrow_mut();
@@ -742,7 +1481,27 @@ pub(crate) fn open_viewer_for_study(
     viewer.on_reset_view(move || {
         let mut session = session_for_reset.borrow_mut();
         let result = if session.volume_preview_active {
-            active_volume_view_state(&mut session).reset();
+            if session.quad_viewport_active {
+                let focused_slice_mode = session.focused_quad_viewport.slice_mode();
+                active_volume_view_state(&mut session).reset();
+                let slice_state = active_slice_view_state(&mut session);
+                slice_state.reset();
+                slice_state.crosshair_world = None;
+                if let Some(slice_mode) = focused_slice_mode {
+                    slice_state.set_mode(slice_mode);
+                }
+            } else if session.advanced_preview_mode.is_dvr() {
+                active_volume_view_state(&mut session).reset();
+            } else {
+                let slice_mode = session
+                    .advanced_preview_mode
+                    .slice_mode()
+                    .unwrap_or_default();
+                let slice_state = active_slice_view_state(&mut session);
+                slice_state.reset();
+                slice_state.crosshair_world = None;
+                slice_state.set_mode(slice_mode);
+            }
             render_or_show_volume_preview(&mut session)
         } else {
             session.active_frame_index = 0;
@@ -840,16 +1599,144 @@ pub(crate) fn open_viewer_for_study(
         let _ = update_measurement_overlays(&session);
     });
 
+    let session_for_layout = session.clone();
+    viewer.on_toggle_layout(move || {
+        let mut session = session_for_layout.borrow_mut();
+        session.quad_viewport_active = !session.quad_viewport_active;
+        session.quad_reference_hover = None;
+        session.quad_reference_drag = None;
+        let result = if session.volume_preview_active {
+            render_or_show_volume_preview(&mut session)
+        } else if let Some(viewer) = session.viewer.upgrade() {
+            viewer.set_layout_label(layout_label(&session).into());
+            viewer.set_quad_view_active(false);
+            viewer.set_focused_quad_viewport(session.focused_quad_viewport.index());
+            Ok(())
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            info!("Failed to toggle viewport layout: {}", error);
+        }
+    });
+
     let session_for_volume_toggle = session.clone();
     let viewer_weak_for_close = viewer.as_weak();
     let imagebox_for_close = imagebox.clone();
+    let session_for_advanced_mode = session.clone();
+    viewer.on_cycle_advanced_preview_mode(move || {
+        let mut session = session_for_advanced_mode.borrow_mut();
+        session.advanced_preview_mode = session.advanced_preview_mode.next();
+        session.focused_quad_viewport = session.advanced_preview_mode.quad_viewport();
+        if let Some(slice_mode) = session.advanced_preview_mode.slice_mode() {
+            let bounds = session
+                .prepared_volumes_by_series
+                .get(&session.active_series_uid)
+                .map(|prepared| prepared.world_bounds());
+            let slice_state = active_slice_view_state(&mut session);
+            slice_state.set_mode(slice_mode);
+            if let Some(bounds) = bounds {
+                slice_state.center_on_crosshair(bounds);
+            }
+        }
+        let result = if session.volume_preview_active {
+            if session.quad_viewport_active {
+                apply_viewport_state(&session)
+            } else {
+                render_or_show_volume_preview(&mut session)
+            }
+        } else if let Some(viewer) = session.viewer.upgrade() {
+            viewer.set_advanced_preview_label(session.advanced_preview_mode.label().into());
+            viewer.set_focused_quad_viewport(session.focused_quad_viewport.index());
+            viewer.set_volume_mode_label(
+                if session.advanced_preview_mode.is_dvr() {
+                    volume_blend_mode_label(
+                        session
+                            .volume_view_state_by_series
+                            .get(&session.active_series_uid)
+                            .map(|state| state.blend_mode)
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    slice_projection_mode_label(
+                        session
+                            .slice_view_state_by_series
+                            .get(&session.active_series_uid)
+                            .map(|state| state.projection_mode)
+                            .unwrap_or_default(),
+                    )
+                }
+                .into(),
+            );
+            Ok(())
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            info!("Failed to change advanced preview mode: {}", error);
+        }
+    });
+    let session_for_volume_mode = session.clone();
+    viewer.on_cycle_volume_mode(move || {
+        let mut session = session_for_volume_mode.borrow_mut();
+        let result = if session.advanced_preview_mode.is_dvr() {
+            let next_mode = {
+                let view_state = active_volume_view_state(&mut session);
+                let next_mode = next_volume_blend_mode(view_state.blend_mode);
+                view_state.blend_mode = next_mode;
+                next_mode
+            };
+            if session.volume_preview_active {
+                render_or_show_volume_preview(&mut session)
+            } else {
+                if let Some(viewer) = session.viewer.upgrade() {
+                    viewer.set_volume_mode_label(volume_blend_mode_label(next_mode).into());
+                }
+                Ok(())
+            }
+        } else {
+            let slice_mode = session
+                .advanced_preview_mode
+                .slice_mode()
+                .unwrap_or_default();
+            let default_half_thickness = session
+                .prepared_volumes_by_series
+                .get(&session.active_series_uid)
+                .map(|prepared| prepared.slice_scroll_step(slice_mode) * 8.0)
+                .unwrap_or(4.0);
+            let next_mode = {
+                let view_state = active_slice_view_state(&mut session);
+                if view_state.mode != slice_mode {
+                    view_state.set_mode(slice_mode);
+                }
+                view_state.cycle_projection_mode(default_half_thickness);
+                view_state.projection_mode
+            };
+            if session.volume_preview_active {
+                render_or_show_volume_preview(&mut session)
+            } else if let Some(viewer) = session.viewer.upgrade() {
+                viewer.set_volume_mode_label(slice_projection_mode_label(next_mode).into());
+                Ok(())
+            } else {
+                Ok(())
+            }
+        };
+        if let Err(error) = result {
+            info!("Failed to change volume blend mode: {}", error);
+        }
+    });
     viewer.on_toggle_volume_preview(move || {
         let mut session = session_for_volume_toggle.borrow_mut();
         let result = if session.volume_preview_active {
             session.volume_preview_active = false;
             session.volume_drag_state = None;
+            session.quad_reference_hover = None;
+            session.quad_reference_drag = None;
             update_viewer_image(&mut session).and_then(|_| update_measurements_model(&session))
         } else {
+            session.viewport_scale = 1.0;
+            session.viewport_offset_x = 0.0;
+            session.viewport_offset_y = 0.0;
             render_or_show_volume_preview(&mut session)
         };
         if let Err(error) = result {
@@ -948,6 +1835,476 @@ fn active_volume_view_state(session: &mut ViewerSession) -> &mut VolumeViewState
         .or_default()
 }
 
+fn active_slice_view_state(session: &mut ViewerSession) -> &mut SlicePreviewState {
+    session
+        .slice_view_state_by_series
+        .entry(session.active_series_uid.clone())
+        .or_default()
+}
+
+fn layout_label(session: &ViewerSession) -> &'static str {
+    if session.quad_viewport_active {
+        "Quad"
+    } else {
+        "1Up"
+    }
+}
+
+fn set_selected_quad_viewport(session: &mut ViewerSession, kind: QuadViewportKind) {
+    session.focused_quad_viewport = kind;
+    session.advanced_preview_mode = kind.advanced_preview_mode();
+}
+
+fn quad_preview(
+    session: &ViewerSession,
+    kind: QuadViewportKind,
+) -> Option<&AdvancedViewportPreview> {
+    session.quad_previews_by_kind.get(&kind)
+}
+
+fn quad_preview_info(session: &ViewerSession, kind: QuadViewportKind) -> String {
+    quad_preview(session, kind)
+        .map(|preview| preview.info.clone())
+        .unwrap_or_default()
+}
+
+fn quad_tile_max_dimensions(session: &ViewerSession) -> (f32, f32) {
+    let width = if session.viewport_width > 0.0 {
+        session.viewport_width * 0.5
+    } else {
+        512.0
+    };
+    let height = if session.viewport_height > 0.0 {
+        session.viewport_height * 0.5
+    } else {
+        512.0
+    };
+    (width.max(256.0), height.max(256.0))
+}
+
+fn quad_mpr_preview_info(kind: QuadViewportKind, state: SlicePreviewState) -> String {
+    format!(
+        "{} {}",
+        kind.title(),
+        slice_projection_mode_label(state.projection_mode)
+    )
+}
+
+fn quad_viewport_geometry(
+    session: &ViewerSession,
+    kind: QuadViewportKind,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> Option<ViewportGeometry> {
+    let preview = quad_preview(session, kind)?;
+    displayed_image_geometry(
+        viewport_width,
+        viewport_height,
+        preview.width,
+        preview.height,
+        1.0,
+        0.0,
+        0.0,
+    )
+}
+
+fn quad_world_to_viewport_point(
+    plane: &SlicePlane,
+    geometry: ViewportGeometry,
+    world: glam::DVec3,
+) -> (f32, f32) {
+    let (uv, _) = plane.world_to_point(world);
+    (
+        geometry.image_origin_x + uv.x as f32 * geometry.image_width,
+        geometry.image_origin_y + uv.y as f32 * geometry.image_height,
+    )
+}
+
+fn clip_line_to_geometry(
+    point_x: f32,
+    point_y: f32,
+    dir_x: f32,
+    dir_y: f32,
+    geometry: ViewportGeometry,
+) -> Option<((f32, f32), (f32, f32))> {
+    let min_x = geometry.image_origin_x;
+    let min_y = geometry.image_origin_y;
+    let max_x = geometry.image_origin_x + geometry.image_width;
+    let max_y = geometry.image_origin_y + geometry.image_height;
+    let mut intersections = Vec::new();
+    const EPSILON: f32 = 1.0e-4;
+
+    if dir_x.abs() > EPSILON {
+        for edge_x in [min_x, max_x] {
+            let t = (edge_x - point_x) / dir_x;
+            let y = point_y + t * dir_y;
+            if y >= min_y - EPSILON && y <= max_y + EPSILON {
+                intersections.push((t, edge_x, y.clamp(min_y, max_y)));
+            }
+        }
+    }
+    if dir_y.abs() > EPSILON {
+        for edge_y in [min_y, max_y] {
+            let t = (edge_y - point_y) / dir_y;
+            let x = point_x + t * dir_x;
+            if x >= min_x - EPSILON && x <= max_x + EPSILON {
+                intersections.push((t, x.clamp(min_x, max_x), edge_y));
+            }
+        }
+    }
+
+    intersections.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    intersections.dedup_by(|a, b| (a.1 - b.1).abs() <= 0.5 && (a.2 - b.2).abs() <= 0.5);
+    let start = intersections.first()?;
+    let end = intersections.last()?;
+    ((start.1 - end.1).abs() > EPSILON || (start.2 - end.2).abs() > EPSILON)
+        .then_some(((start.1, start.2), (end.1, end.2)))
+}
+
+fn quad_reference_line_for_plane(
+    current_plane: &SlicePlane,
+    other_plane: &SlicePlane,
+    source_kind: QuadViewportKind,
+    shared_world: glam::DVec3,
+    geometry: ViewportGeometry,
+) -> Option<QuadReferenceLineOverlay> {
+    let direction = current_plane.normal().cross(other_plane.normal());
+    if direction.length_squared() <= 1.0e-10 {
+        return None;
+    }
+    let line_extent = current_plane.width.max(current_plane.height).max(1.0);
+    let dir = direction.normalize();
+    let (center_x, center_y) = quad_world_to_viewport_point(current_plane, geometry, shared_world);
+    let (dir_x, dir_y) =
+        quad_world_to_viewport_point(current_plane, geometry, shared_world + dir * line_extent);
+    let ((start_x, start_y), (end_x, end_y)) = clip_line_to_geometry(
+        center_x,
+        center_y,
+        dir_x - center_x,
+        dir_y - center_y,
+        geometry,
+    )?;
+    Some(QuadReferenceLineOverlay {
+        commands: format!("M {start_x:.1} {start_y:.1} L {end_x:.1} {end_y:.1}"),
+        start_x,
+        start_y,
+        end_x,
+        end_y,
+        handle1_x: (center_x + start_x) * 0.5,
+        handle1_y: (center_y + start_y) * 0.5,
+        handle2_x: (center_x + end_x) * 0.5,
+        handle2_y: (center_y + end_y) * 0.5,
+        source_kind,
+    })
+}
+
+fn rebuild_quad_reference_lines(session: &mut ViewerSession) -> LeafResult<()> {
+    let viewer = session
+        .viewer
+        .upgrade()
+        .ok_or_else(|| LeafError::Render("Viewer window no longer available".into()))?;
+    if !session.volume_preview_active || !session.quad_viewport_active {
+        viewer.set_quad_axial_reference_lines(empty_quad_reference_line_model());
+        viewer.set_quad_coronal_reference_lines(empty_quad_reference_line_model());
+        viewer.set_quad_sagittal_reference_lines(empty_quad_reference_line_model());
+        session.quad_reference_lines_by_kind.clear();
+        return Ok(());
+    }
+
+    let prepared = session
+        .prepared_volumes_by_series
+        .get(&session.active_series_uid)
+        .ok_or_else(|| LeafError::Render("Prepared volume missing".into()))?;
+    let (tile_width, tile_height) = quad_tile_max_dimensions(session);
+    for kind in [
+        QuadViewportKind::Axial,
+        QuadViewportKind::Coronal,
+        QuadViewportKind::Sagittal,
+    ] {
+        let Some(current_state) = quad_slice_view_state_for_kind(session, prepared, kind) else {
+            continue;
+        };
+        let Some(geometry) = quad_viewport_geometry(session, kind, tile_width, tile_height) else {
+            continue;
+        };
+        let current_plane = current_state.slice_plane(prepared.world_bounds());
+        let shared_world = current_state.crosshair_world(prepared.world_bounds());
+        let overlays = kind
+            .linked_mpr_views()
+            .into_iter()
+            .filter_map(|other_kind| {
+                quad_slice_view_state_for_kind(session, prepared, other_kind).and_then(
+                    |other_state| {
+                        quad_reference_line_for_plane(
+                            &current_plane,
+                            &other_state.slice_plane(prepared.world_bounds()),
+                            other_kind,
+                            shared_world,
+                            geometry,
+                        )
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        session.quad_reference_lines_by_kind.insert(kind, overlays);
+        let model = quad_reference_line_model(session, kind);
+        match kind {
+            QuadViewportKind::Axial => viewer.set_quad_axial_reference_lines(model),
+            QuadViewportKind::Coronal => viewer.set_quad_coronal_reference_lines(model),
+            QuadViewportKind::Sagittal => viewer.set_quad_sagittal_reference_lines(model),
+            QuadViewportKind::Dvr => {}
+        }
+    }
+    Ok(())
+}
+
+fn quad_mpr_angle_from_viewport(
+    session: &ViewerSession,
+    kind: QuadViewportKind,
+    x: f32,
+    y: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> Option<f64> {
+    let prepared = session
+        .prepared_volumes_by_series
+        .get(&session.active_series_uid)?;
+    let slice_state = quad_slice_view_state_for_kind(session, prepared, kind)?;
+    let bounds = prepared.world_bounds();
+    let plane = slice_state.slice_plane(bounds);
+    let shared_world = slice_state.crosshair_world(bounds);
+    let pointer_world =
+        quad_mpr_world_point_from_viewport(session, kind, x, y, viewport_width, viewport_height)?;
+    let offset = pointer_world - shared_world;
+    let dx = offset.dot(plane.right);
+    let dy = offset.dot(plane.up);
+    if dx.abs() < 1.0e-4_f64 && dy.abs() < 1.0e-4_f64 {
+        return None;
+    }
+    Some(dy.atan2(dx))
+}
+
+fn quad_crosshair_viewport_point(
+    session: &ViewerSession,
+    kind: QuadViewportKind,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> Option<(f32, f32)> {
+    let geometry = quad_viewport_geometry(session, kind, viewport_width, viewport_height)?;
+    let prepared = session
+        .prepared_volumes_by_series
+        .get(&session.active_series_uid)?;
+    let slice_state = quad_slice_view_state_for_kind(session, prepared, kind)?;
+    let bounds = prepared.world_bounds();
+    let plane = slice_state.slice_plane(bounds);
+    let shared_world = slice_state.crosshair_world(bounds);
+    Some(quad_world_to_viewport_point(&plane, geometry, shared_world))
+}
+
+fn normalized_angle_delta(current_angle_rad: f64, start_angle_rad: f64) -> f64 {
+    let mut delta = current_angle_rad - start_angle_rad;
+    while delta <= -std::f64::consts::PI {
+        delta += std::f64::consts::TAU;
+    }
+    while delta > std::f64::consts::PI {
+        delta -= std::f64::consts::TAU;
+    }
+    delta
+}
+
+fn point_to_segment_distance_sq(
+    point_x: f32,
+    point_y: f32,
+    start_x: f32,
+    start_y: f32,
+    end_x: f32,
+    end_y: f32,
+) -> f32 {
+    let dx = end_x - start_x;
+    let dy = end_y - start_y;
+    let length_sq = dx * dx + dy * dy;
+    if length_sq <= 1.0e-4 {
+        let px = point_x - start_x;
+        let py = point_y - start_y;
+        return px * px + py * py;
+    }
+    let t = (((point_x - start_x) * dx) + ((point_y - start_y) * dy)) / length_sq;
+    let t = t.clamp(0.0, 1.0);
+    let proj_x = start_x + dx * t;
+    let proj_y = start_y + dy * t;
+    let px = point_x - proj_x;
+    let py = point_y - proj_y;
+    px * px + py * py
+}
+
+fn quad_reference_line_hit(
+    session: &ViewerSession,
+    kind: QuadViewportKind,
+    x: f32,
+    y: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> Option<QuadReferenceSelection> {
+    const CENTER_THRESHOLD_SQ: f32 = 144.0;
+    const HANDLE_THRESHOLD_SQ: f32 = 100.0;
+    const LINE_THRESHOLD_SQ: f32 = 81.0;
+
+    if let Some((center_x, center_y)) =
+        quad_crosshair_viewport_point(session, kind, viewport_width, viewport_height)
+    {
+        let dx = x - center_x;
+        let dy = y - center_y;
+        if dx * dx + dy * dy <= CENTER_THRESHOLD_SQ {
+            return Some(QuadReferenceSelection {
+                view: kind,
+                target: QuadReferenceTarget::Center,
+            });
+        }
+    }
+
+    if let Some((_, source_kind)) = session
+        .quad_reference_lines_by_kind
+        .get(&kind)
+        .into_iter()
+        .flat_map(|lines| lines.iter())
+        .filter_map(|line| {
+            let distance_sq = point_to_segment_distance_sq(
+                x,
+                y,
+                line.handle1_x,
+                line.handle1_y,
+                line.handle1_x,
+                line.handle1_y,
+            )
+            .min(point_to_segment_distance_sq(
+                x,
+                y,
+                line.handle2_x,
+                line.handle2_y,
+                line.handle2_x,
+                line.handle2_y,
+            ));
+            (distance_sq <= HANDLE_THRESHOLD_SQ).then_some((distance_sq, line.source_kind))
+        })
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal))
+    {
+        return Some(QuadReferenceSelection {
+            view: kind,
+            target: QuadReferenceTarget::RotateLine(source_kind),
+        });
+    }
+
+    session
+        .quad_reference_lines_by_kind
+        .get(&kind)
+        .into_iter()
+        .flat_map(|lines| lines.iter())
+        .filter_map(|line| {
+            let line_distance_sq = point_to_segment_distance_sq(
+                x,
+                y,
+                line.start_x,
+                line.start_y,
+                line.end_x,
+                line.end_y,
+            );
+            let handle_distance_sq = point_to_segment_distance_sq(
+                x,
+                y,
+                line.handle1_x,
+                line.handle1_y,
+                line.handle1_x,
+                line.handle1_y,
+            )
+            .min(point_to_segment_distance_sq(
+                x,
+                y,
+                line.handle2_x,
+                line.handle2_y,
+                line.handle2_x,
+                line.handle2_y,
+            ));
+            (line_distance_sq <= LINE_THRESHOLD_SQ && handle_distance_sq > HANDLE_THRESHOLD_SQ)
+                .then_some((
+                    line_distance_sq,
+                    QuadReferenceSelection {
+                        view: kind,
+                        target: QuadReferenceTarget::TranslateLine(line.source_kind),
+                    },
+                ))
+        })
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal))
+        .map(|(_, selection)| selection)
+}
+
+fn quad_reference_line_highlighted(
+    session: &ViewerSession,
+    view: QuadViewportKind,
+    source_kind: QuadViewportKind,
+) -> bool {
+    let drag_active = matches!(
+        session.quad_reference_drag,
+        Some(QuadReferenceDrag::TranslateLine {
+            view: drag_view,
+            line_kind,
+            ..
+        } | QuadReferenceDrag::RotateLine {
+            view: drag_view,
+            line_kind,
+            ..
+        }) if (drag_view, line_kind) == (view, source_kind)
+    );
+    let hover_active = matches!(
+        session.quad_reference_hover,
+        Some(QuadReferenceSelection {
+            view: hover_view,
+            target: QuadReferenceTarget::TranslateLine(line_kind)
+                | QuadReferenceTarget::RotateLine(line_kind),
+        }) if (hover_view, line_kind) == (view, source_kind)
+    );
+    drag_active || hover_active
+}
+
+fn quad_reference_center_highlighted(session: &ViewerSession, view: QuadViewportKind) -> bool {
+    matches!(
+        session.quad_reference_drag,
+        Some(QuadReferenceDrag::Center { view: drag_view }) if drag_view == view
+    ) || matches!(
+        session.quad_reference_hover,
+        Some(QuadReferenceSelection {
+            view: hover_view,
+            target: QuadReferenceTarget::Center,
+        }) if hover_view == view
+    )
+}
+
+fn volume_blend_mode_label(mode: VolumeBlendMode) -> &'static str {
+    match mode {
+        VolumeBlendMode::Composite => "Comp",
+        VolumeBlendMode::MaximumIntensity => "MIP",
+        VolumeBlendMode::MinimumIntensity => "MinIP",
+        VolumeBlendMode::AverageIntensity => "Avg",
+    }
+}
+
+fn next_volume_blend_mode(mode: VolumeBlendMode) -> VolumeBlendMode {
+    match mode {
+        VolumeBlendMode::Composite => VolumeBlendMode::MaximumIntensity,
+        VolumeBlendMode::MaximumIntensity => VolumeBlendMode::MinimumIntensity,
+        VolumeBlendMode::MinimumIntensity => VolumeBlendMode::AverageIntensity,
+        VolumeBlendMode::AverageIntensity => VolumeBlendMode::Composite,
+    }
+}
+
+fn slice_projection_mode_label(mode: SliceProjectionMode) -> &'static str {
+    match mode {
+        SliceProjectionMode::Thin => "Thin",
+        SliceProjectionMode::MaximumIntensity => "MIP",
+        SliceProjectionMode::MinimumIntensity => "MinIP",
+        SliceProjectionMode::AverageIntensity => "Avg",
+    }
+}
+
 fn apply_volume_drag(
     session: &mut ViewerSession,
     start_view_state: VolumeViewState,
@@ -1006,6 +2363,35 @@ fn empty_measurement_overlay_model() -> ModelRc<leaf_ui::MeasurementOverlay> {
     ModelRc::from(Rc::new(VecModel::from(
         Vec::<leaf_ui::MeasurementOverlay>::new(),
     )))
+}
+
+fn empty_quad_reference_line_model() -> ModelRc<leaf_ui::QuadReferenceLine> {
+    ModelRc::from(Rc::new(VecModel::from(
+        Vec::<leaf_ui::QuadReferenceLine>::new(),
+    )))
+}
+
+fn quad_reference_line_model(
+    session: &ViewerSession,
+    kind: QuadViewportKind,
+) -> ModelRc<leaf_ui::QuadReferenceLine> {
+    let entries = session
+        .quad_reference_lines_by_kind
+        .get(&kind)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|overlay| leaf_ui::QuadReferenceLine {
+            commands: overlay.commands.into(),
+            h1_x: overlay.handle1_x,
+            h1_y: overlay.handle1_y,
+            h2_x: overlay.handle2_x,
+            h2_y: overlay.handle2_y,
+            kind: overlay.source_kind.index(),
+            active: quad_reference_line_highlighted(session, kind, overlay.source_kind),
+        })
+        .collect::<Vec<_>>();
+    ModelRc::from(Rc::new(VecModel::from(entries)))
 }
 
 fn update_viewport_dimensions(
@@ -1667,11 +3053,111 @@ fn apply_orientation_labels(
     viewer.set_orientation_right(right.into());
 }
 
+fn orientation_labels_for_slice_plane(plane: &SlicePlane) -> (String, String, String, String) {
+    (
+        patient_orientation_label([-plane.up.x, -plane.up.y, -plane.up.z]),
+        patient_orientation_label([plane.up.x, plane.up.y, plane.up.z]),
+        patient_orientation_label([-plane.right.x, -plane.right.y, -plane.right.z]),
+        patient_orientation_label([plane.right.x, plane.right.y, plane.right.z]),
+    )
+}
+
+fn apply_slice_orientation_labels(viewer: &leaf_ui::StudyViewerWindow, plane: &SlicePlane) {
+    let (top, bottom, left, right) = orientation_labels_for_slice_plane(plane);
+    viewer.set_orientation_top(top.into());
+    viewer.set_orientation_bottom(bottom.into());
+    viewer.set_orientation_left(left.into());
+    viewer.set_orientation_right(right.into());
+}
+
 fn clear_orientation_labels(viewer: &leaf_ui::StudyViewerWindow) {
     viewer.set_orientation_top("".into());
     viewer.set_orientation_bottom("".into());
     viewer.set_orientation_left("".into());
     viewer.set_orientation_right("".into());
+}
+
+fn apply_quad_orientation_labels(
+    viewer: &leaf_ui::StudyViewerWindow,
+    kind: QuadViewportKind,
+    plane: Option<&SlicePlane>,
+) {
+    let (top, bottom, left, right) = plane
+        .map(orientation_labels_for_slice_plane)
+        .unwrap_or_else(|| (String::new(), String::new(), String::new(), String::new()));
+    match kind {
+        QuadViewportKind::Axial => {
+            viewer.set_quad_axial_orientation_top(top.into());
+            viewer.set_quad_axial_orientation_bottom(bottom.into());
+            viewer.set_quad_axial_orientation_left(left.into());
+            viewer.set_quad_axial_orientation_right(right.into());
+        }
+        QuadViewportKind::Coronal => {
+            viewer.set_quad_coronal_orientation_top(top.into());
+            viewer.set_quad_coronal_orientation_bottom(bottom.into());
+            viewer.set_quad_coronal_orientation_left(left.into());
+            viewer.set_quad_coronal_orientation_right(right.into());
+        }
+        QuadViewportKind::Sagittal => {
+            viewer.set_quad_sagittal_orientation_top(top.into());
+            viewer.set_quad_sagittal_orientation_bottom(bottom.into());
+            viewer.set_quad_sagittal_orientation_left(left.into());
+            viewer.set_quad_sagittal_orientation_right(right.into());
+        }
+        QuadViewportKind::Dvr => {}
+    }
+}
+
+fn clear_quad_orientation_labels(viewer: &leaf_ui::StudyViewerWindow) {
+    for kind in [
+        QuadViewportKind::Axial,
+        QuadViewportKind::Coronal,
+        QuadViewportKind::Sagittal,
+    ] {
+        apply_quad_orientation_labels(viewer, kind, None);
+    }
+}
+
+fn apply_quad_crosshair_handle(
+    viewer: &leaf_ui::StudyViewerWindow,
+    kind: QuadViewportKind,
+    point: Option<(f32, f32)>,
+    active: bool,
+) {
+    let (x, y, visible) = point
+        .map(|(x, y)| (x, y, true))
+        .unwrap_or((0.0, 0.0, false));
+    match kind {
+        QuadViewportKind::Axial => {
+            viewer.set_quad_axial_crosshair_x(x);
+            viewer.set_quad_axial_crosshair_y(y);
+            viewer.set_quad_axial_crosshair_visible(visible);
+            viewer.set_quad_axial_crosshair_active(active);
+        }
+        QuadViewportKind::Coronal => {
+            viewer.set_quad_coronal_crosshair_x(x);
+            viewer.set_quad_coronal_crosshair_y(y);
+            viewer.set_quad_coronal_crosshair_visible(visible);
+            viewer.set_quad_coronal_crosshair_active(active);
+        }
+        QuadViewportKind::Sagittal => {
+            viewer.set_quad_sagittal_crosshair_x(x);
+            viewer.set_quad_sagittal_crosshair_y(y);
+            viewer.set_quad_sagittal_crosshair_visible(visible);
+            viewer.set_quad_sagittal_crosshair_active(active);
+        }
+        QuadViewportKind::Dvr => {}
+    }
+}
+
+fn clear_quad_crosshair_handles(viewer: &leaf_ui::StudyViewerWindow) {
+    for kind in [
+        QuadViewportKind::Axial,
+        QuadViewportKind::Coronal,
+        QuadViewportKind::Sagittal,
+    ] {
+        apply_quad_crosshair_handle(viewer, kind, None, false);
+    }
 }
 
 fn image_to_viewport_point(session: &ViewerSession, point: DVec2) -> Option<(f32, f32)> {
@@ -1741,6 +3227,112 @@ fn current_viewport_geometry(session: &ViewerSession) -> Option<ViewportGeometry
         session.viewport_offset_x,
         session.viewport_offset_y,
     )
+}
+
+fn mpr_uv_from_viewport(geometry: ViewportGeometry, x: f32, y: f32) -> Option<DVec2> {
+    let normalized_x = (x - geometry.image_origin_x) / geometry.image_width;
+    let normalized_y = (y - geometry.image_origin_y) / geometry.image_height;
+    if !(0.0..=1.0).contains(&normalized_x) || !(0.0..=1.0).contains(&normalized_y) {
+        return None;
+    }
+    Some(DVec2::new(normalized_x as f64, normalized_y as f64))
+}
+
+fn mpr_world_point_from_viewport(session: &ViewerSession, x: f32, y: f32) -> Option<glam::DVec3> {
+    if !session.volume_preview_active || session.advanced_preview_mode.is_dvr() {
+        return None;
+    }
+    let geometry = current_viewport_geometry(session)?;
+    let prepared = session
+        .prepared_volumes_by_series
+        .get(&session.active_series_uid)?;
+    let slice_state = session
+        .slice_view_state_by_series
+        .get(&session.active_series_uid)
+        .copied()
+        .unwrap_or_default();
+    let slice_uv = mpr_uv_from_viewport(geometry, x, y)?;
+    let plane = slice_state.slice_plane(prepared.world_bounds());
+    Some(plane.point_to_world(slice_uv))
+}
+
+fn quad_slice_view_state_for_kind(
+    session: &ViewerSession,
+    prepared: &PreparedVolume,
+    kind: QuadViewportKind,
+) -> Option<SlicePreviewState> {
+    let slice_mode = kind.slice_mode()?;
+    let scalar_range = prepared.scalar_range();
+    let bounds = prepared.world_bounds();
+    let mut state = session
+        .slice_view_state_by_series
+        .get(&session.active_series_uid)
+        .copied()
+        .unwrap_or_default();
+    if state.mode != slice_mode {
+        state.set_mode(slice_mode);
+    }
+    state.ensure_transfer_window(scalar_range.0, scalar_range.1);
+    state.center_on_crosshair(bounds);
+    Some(state)
+}
+
+fn quad_mpr_world_point_from_viewport(
+    session: &ViewerSession,
+    kind: QuadViewportKind,
+    x: f32,
+    y: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> Option<glam::DVec3> {
+    let preview = quad_preview(session, kind)?;
+    let geometry = displayed_image_geometry(
+        viewport_width,
+        viewport_height,
+        preview.width,
+        preview.height,
+        1.0,
+        0.0,
+        0.0,
+    )?;
+    let prepared = session
+        .prepared_volumes_by_series
+        .get(&session.active_series_uid)?;
+    let slice_state = quad_slice_view_state_for_kind(session, prepared, kind)?;
+    let slice_uv = mpr_uv_from_viewport(geometry, x, y)?;
+    let plane = slice_state.slice_plane(prepared.world_bounds());
+    Some(plane.point_to_world(slice_uv))
+}
+
+fn adjust_quad_crosshair_by_scroll(
+    session: &mut ViewerSession,
+    kind: QuadViewportKind,
+    delta: f32,
+) -> LeafResult<()> {
+    let Some(slice_mode) = kind.slice_mode() else {
+        return Ok(());
+    };
+    let prepared = session
+        .prepared_volumes_by_series
+        .get(&session.active_series_uid)
+        .ok_or_else(|| LeafError::Render("Prepared volume missing".into()))?;
+    let bounds = prepared.world_bounds();
+    let step = prepared.slice_scroll_step(slice_mode);
+    let delta_mm = if delta < 0.0 {
+        step
+    } else if delta > 0.0 {
+        -step
+    } else {
+        0.0
+    };
+    let slice_state = active_slice_view_state(session);
+    if slice_state.mode != slice_mode {
+        slice_state.set_mode(slice_mode);
+    }
+    let normal = slice_state.slice_plane(bounds).normal();
+    let world = slice_state.crosshair_world(bounds) + normal * delta_mm;
+    slice_state.center_on_world(world, bounds);
+    Ok(())
 }
 
 fn displayed_image_geometry(
@@ -1899,37 +3491,233 @@ fn apply_viewport_state(session: &ViewerSession) -> LeafResult<()> {
 
     viewer.set_active_tool(session.active_tool);
     viewer.set_volume_preview_active(session.volume_preview_active);
+    viewer.set_quad_view_active(session.volume_preview_active && session.quad_viewport_active);
+    viewer.set_layout_label(layout_label(session).into());
+    viewer.set_focused_quad_viewport(session.focused_quad_viewport.index());
     viewer.set_image_rotated(session.image_transform.is_rotated());
     viewer.set_image_flipped_h(session.image_transform.flip_horizontal);
     viewer.set_image_flipped_v(session.image_transform.flip_vertical);
     viewer.set_image_inverted(session.image_transform.invert);
     viewer.set_lut_label(lut_label(&session.active_lut_name).into());
-
-    if session.volume_preview_active {
+    viewer.set_advanced_preview_label(session.advanced_preview_mode.label().into());
+    viewer.set_quad_axial_info(quad_preview_info(session, QuadViewportKind::Axial).into());
+    viewer.set_quad_coronal_info(quad_preview_info(session, QuadViewportKind::Coronal).into());
+    viewer.set_quad_sagittal_info(quad_preview_info(session, QuadViewportKind::Sagittal).into());
+    viewer.set_quad_dvr_info(quad_preview_info(session, QuadViewportKind::Dvr).into());
+    if session.volume_preview_active && session.quad_viewport_active {
+        viewer.set_quad_axial_reference_lines(quad_reference_line_model(
+            session,
+            QuadViewportKind::Axial,
+        ));
+        viewer.set_quad_coronal_reference_lines(quad_reference_line_model(
+            session,
+            QuadViewportKind::Coronal,
+        ));
+        viewer.set_quad_sagittal_reference_lines(quad_reference_line_model(
+            session,
+            QuadViewportKind::Sagittal,
+        ));
         if let Some(prepared) = session
             .prepared_volumes_by_series
             .get(&session.active_series_uid)
         {
-            let (center, width) = session
+            let bounds = prepared.world_bounds();
+            let (tile_width, tile_height) = quad_tile_max_dimensions(session);
+            for kind in [
+                QuadViewportKind::Axial,
+                QuadViewportKind::Coronal,
+                QuadViewportKind::Sagittal,
+            ] {
+                let plane = quad_slice_view_state_for_kind(session, prepared, kind)
+                    .map(|state| state.slice_plane(bounds));
+                apply_quad_orientation_labels(&viewer, kind, plane.as_ref());
+                apply_quad_crosshair_handle(
+                    &viewer,
+                    kind,
+                    quad_crosshair_viewport_point(session, kind, tile_width, tile_height),
+                    quad_reference_center_highlighted(session, kind),
+                );
+            }
+        } else {
+            clear_quad_orientation_labels(&viewer);
+            clear_quad_crosshair_handles(&viewer);
+        }
+    } else {
+        viewer.set_quad_axial_reference_lines(empty_quad_reference_line_model());
+        viewer.set_quad_coronal_reference_lines(empty_quad_reference_line_model());
+        viewer.set_quad_sagittal_reference_lines(empty_quad_reference_line_model());
+        clear_quad_orientation_labels(&viewer);
+        clear_quad_crosshair_handles(&viewer);
+    }
+    viewer.set_volume_mode_label(
+        if session.advanced_preview_mode.is_dvr() {
+            volume_blend_mode_label(
+                session
+                    .volume_view_state_by_series
+                    .get(&session.active_series_uid)
+                    .map(|state| state.blend_mode)
+                    .unwrap_or_default(),
+            )
+        } else {
+            slice_projection_mode_label(
+                session
+                    .slice_view_state_by_series
+                    .get(&session.active_series_uid)
+                    .map(|state| state.projection_mode)
+                    .unwrap_or_default(),
+            )
+        }
+        .into(),
+    );
+
+    if session.volume_preview_active {
+        if session.quad_viewport_active {
+            if session.focused_quad_viewport.is_dvr() {
+                let blend_mode = session
+                    .volume_view_state_by_series
+                    .get(&session.active_series_uid)
+                    .map(|state| state.blend_mode)
+                    .unwrap_or_default();
+                if let Some(prepared) = session
+                    .prepared_volumes_by_series
+                    .get(&session.active_series_uid)
+                {
+                    let (center, width) = session
+                        .volume_view_state_by_series
+                        .get(&session.active_series_uid)
+                        .copied()
+                        .unwrap_or_default()
+                        .transfer_window(prepared.scalar_range().0, prepared.scalar_range().1);
+                    viewer.set_window_info(format!("Quad 3D C:{center:.0} W:{width:.0}").into());
+                } else {
+                    viewer.set_window_info("Quad DVR".into());
+                }
+                let volume_zoom = session
+                    .volume_view_state_by_series
+                    .get(&session.active_series_uid)
+                    .map(|state| state.zoom)
+                    .unwrap_or(1.0);
+                viewer.set_zoom_info(format!("3D {:.0}%", volume_zoom * 100.0).into());
+                viewer
+                    .set_slice_info(format!("Quad {}", volume_blend_mode_label(blend_mode)).into());
+            } else {
+                let projection_mode = session
+                    .slice_view_state_by_series
+                    .get(&session.active_series_uid)
+                    .map(|state| state.projection_mode)
+                    .unwrap_or_default();
+                if let Some(prepared) = session
+                    .prepared_volumes_by_series
+                    .get(&session.active_series_uid)
+                {
+                    let (center, width) = session
+                        .slice_view_state_by_series
+                        .get(&session.active_series_uid)
+                        .copied()
+                        .unwrap_or_default()
+                        .transfer_window(prepared.scalar_range().0, prepared.scalar_range().1);
+                    viewer.set_window_info(format!("Quad MPR C:{center:.0} W:{width:.0}").into());
+                } else {
+                    viewer.set_window_info("Quad MPR".into());
+                }
+                viewer.set_zoom_info("Quad linked".into());
+                viewer.set_slice_info(
+                    format!(
+                        "Quad {} {}",
+                        session.focused_quad_viewport.title(),
+                        slice_projection_mode_label(projection_mode)
+                    )
+                    .into(),
+                );
+            }
+            viewer.set_viewport_scale(1.0);
+            viewer.set_viewport_offset_x(0.0);
+            viewer.set_viewport_offset_y(0.0);
+            clear_orientation_labels(&viewer);
+            update_measurement_overlays(session)?;
+            return Ok(());
+        }
+
+        if session.advanced_preview_mode.is_dvr() {
+            let blend_mode = session
                 .volume_view_state_by_series
                 .get(&session.active_series_uid)
-                .copied()
-                .unwrap_or_default()
-                .transfer_window(prepared.scalar_range().0, prepared.scalar_range().1);
-            viewer.set_window_info(format!("3D C:{center:.0} W:{width:.0}").into());
+                .map(|state| state.blend_mode)
+                .unwrap_or_default();
+            if let Some(prepared) = session
+                .prepared_volumes_by_series
+                .get(&session.active_series_uid)
+            {
+                let (center, width) = session
+                    .volume_view_state_by_series
+                    .get(&session.active_series_uid)
+                    .copied()
+                    .unwrap_or_default()
+                    .transfer_window(prepared.scalar_range().0, prepared.scalar_range().1);
+                viewer.set_window_info(format!("3D C:{center:.0} W:{width:.0}").into());
+            } else {
+                viewer.set_window_info("DVR preview".into());
+            }
+            let volume_zoom = session
+                .volume_view_state_by_series
+                .get(&session.active_series_uid)
+                .map(|state| state.zoom)
+                .unwrap_or(1.0);
+            viewer.set_viewport_scale(1.0);
+            viewer.set_viewport_offset_x(0.0);
+            viewer.set_viewport_offset_y(0.0);
+            viewer.set_zoom_info(format!("3D {:.0}%", volume_zoom * 100.0).into());
+            viewer.set_slice_info(format!("3D {}", volume_blend_mode_label(blend_mode)).into());
+            clear_orientation_labels(&viewer);
         } else {
-            viewer.set_window_info("DVR preview".into());
+            let projection_mode = session
+                .slice_view_state_by_series
+                .get(&session.active_series_uid)
+                .map(|state| state.projection_mode)
+                .unwrap_or_default();
+            if let Some(prepared) = session
+                .prepared_volumes_by_series
+                .get(&session.active_series_uid)
+            {
+                let bounds = prepared.world_bounds();
+                let (center, width) = session
+                    .slice_view_state_by_series
+                    .get(&session.active_series_uid)
+                    .copied()
+                    .unwrap_or_default()
+                    .transfer_window(prepared.scalar_range().0, prepared.scalar_range().1);
+                viewer.set_window_info(format!("MPR C:{center:.0} W:{width:.0}").into());
+                let slice_mode = session
+                    .advanced_preview_mode
+                    .slice_mode()
+                    .unwrap_or_default();
+                let mut state = session
+                    .slice_view_state_by_series
+                    .get(&session.active_series_uid)
+                    .copied()
+                    .unwrap_or_default();
+                if state.mode != slice_mode {
+                    state.set_mode(slice_mode);
+                }
+                state.center_on_crosshair(bounds);
+                apply_slice_orientation_labels(&viewer, &state.slice_plane(bounds));
+            } else {
+                viewer.set_window_info("MPR preview".into());
+                clear_orientation_labels(&viewer);
+            }
+            viewer.set_zoom_info(format!("{:.0}%", session.viewport_scale * 100.0).into());
+            viewer.set_viewport_scale(session.viewport_scale);
+            viewer.set_viewport_offset_x(session.viewport_offset_x);
+            viewer.set_viewport_offset_y(session.viewport_offset_y);
+            viewer.set_slice_info(
+                format!(
+                    "MPR {} {}",
+                    session.advanced_preview_mode.label(),
+                    slice_projection_mode_label(projection_mode)
+                )
+                .into(),
+            );
         }
-        let volume_zoom = session
-            .volume_view_state_by_series
-            .get(&session.active_series_uid)
-            .map(|state| state.zoom)
-            .unwrap_or(1.0);
-        viewer.set_viewport_scale(1.0);
-        viewer.set_viewport_offset_x(0.0);
-        viewer.set_viewport_offset_y(0.0);
-        viewer.set_zoom_info(format!("3D {:.0}%", volume_zoom * 100.0).into());
-        clear_orientation_labels(&viewer);
         update_measurement_overlays(session)?;
         return Ok(());
     }
@@ -1948,11 +3736,7 @@ fn apply_viewport_state(session: &ViewerSession) -> LeafResult<()> {
     Ok(())
 }
 
-fn render_or_show_volume_preview(session: &mut ViewerSession) -> LeafResult<()> {
-    render_volume_preview(session, false)
-}
-
-fn render_volume_preview(session: &mut ViewerSession, interactive: bool) -> LeafResult<()> {
+fn ensure_active_prepared_volume(session: &mut ViewerSession) -> LeafResult<String> {
     let series_uid = session.active_series_uid.clone();
     if !session.prepared_volumes_by_series.contains_key(&series_uid) {
         let file_paths = active_series_file_paths(session)?;
@@ -1964,6 +3748,21 @@ fn render_volume_preview(session: &mut ViewerSession, interactive: bool) -> Leaf
             .prepared_volumes_by_series
             .insert(series_uid.clone(), prepared);
     }
+    Ok(series_uid)
+}
+
+fn render_or_show_volume_preview(session: &mut ViewerSession) -> LeafResult<()> {
+    if session.quad_viewport_active {
+        render_quad_volume_preview(session)
+    } else if session.advanced_preview_mode.is_dvr() {
+        render_volume_preview(session, false)
+    } else {
+        render_slice_preview(session)
+    }
+}
+
+fn render_volume_preview(session: &mut ViewerSession, interactive: bool) -> LeafResult<()> {
+    let series_uid = ensure_active_prepared_volume(session)?;
     let preview_size = preview_dimensions(session);
     let scalar_range = session
         .prepared_volumes_by_series
@@ -2002,6 +3801,218 @@ fn render_volume_preview(session: &mut ViewerSession, interactive: bool) -> Leaf
     show_volume_preview(session, &preview)
 }
 
+fn render_slice_preview(session: &mut ViewerSession) -> LeafResult<()> {
+    let series_uid = ensure_active_prepared_volume(session)?;
+    let prepared = session
+        .prepared_volumes_by_series
+        .get(&series_uid)
+        .cloned()
+        .ok_or_else(|| LeafError::Render("Prepared volume missing".into()))?;
+    let scalar_range = prepared.scalar_range();
+    let bounds = prepared.world_bounds();
+    let slice_mode = session
+        .advanced_preview_mode
+        .slice_mode()
+        .unwrap_or_default();
+    let preview_size = slice_preview_dimensions(session, &prepared, slice_mode);
+    {
+        let slice_state = active_slice_view_state(session);
+        if slice_state.mode != slice_mode {
+            slice_state.set_mode(slice_mode);
+        }
+        slice_state.ensure_transfer_window(scalar_range.0, scalar_range.1);
+        slice_state.center_on_crosshair(bounds);
+    }
+    let view_state = session
+        .slice_view_state_by_series
+        .get(&series_uid)
+        .copied()
+        .unwrap_or_else(|| {
+            let mut state = SlicePreviewState::default();
+            state.set_mode(slice_mode);
+            state
+        });
+    if session.volume_renderer.is_none() {
+        session.volume_renderer = Some(VolumePreviewRenderer::new()?);
+    }
+    let preview = {
+        let renderer = session
+            .volume_renderer
+            .as_mut()
+            .ok_or_else(|| LeafError::Render("Volume renderer unavailable".into()))?;
+        renderer.render_prepared_slice_preview(
+            &prepared,
+            &view_state,
+            preview_size.0,
+            preview_size.1,
+            true,
+        )?
+    };
+    show_volume_preview(session, &preview)
+}
+
+fn render_quad_preview_for_kind(
+    session: &mut ViewerSession,
+    kind: QuadViewportKind,
+    interactive: bool,
+) -> LeafResult<AdvancedViewportPreview> {
+    let series_uid = ensure_active_prepared_volume(session)?;
+    let prepared = session
+        .prepared_volumes_by_series
+        .get(&series_uid)
+        .cloned()
+        .ok_or_else(|| LeafError::Render("Prepared volume missing".into()))?;
+    let (tile_width, tile_height) = quad_tile_max_dimensions(session);
+
+    if kind.is_dvr() {
+        let preview_size = preview_dimensions_for_viewport(tile_width, tile_height);
+        let scalar_range = prepared.scalar_range();
+        active_volume_view_state(session).ensure_transfer_window(scalar_range.0, scalar_range.1);
+        let view_state = session
+            .volume_view_state_by_series
+            .get(&series_uid)
+            .copied()
+            .unwrap_or_default();
+        let preview = {
+            let renderer = ensure_volume_renderer(session)?;
+            renderer.render_prepared_preview(
+                &prepared,
+                &view_state,
+                preview_size.0,
+                preview_size.1,
+                interactive,
+            )?
+        };
+        return Ok(AdvancedViewportPreview {
+            width: preview.width,
+            height: preview.height,
+            image: leaf_ui::image_from_rgba8(preview.width, preview.height, preview.rgba)
+                .map_err(|error| LeafError::Render(error.to_string()))?,
+            info: format!("DVR {}", volume_blend_mode_label(view_state.blend_mode)),
+        });
+    }
+
+    let slice_state = quad_slice_view_state_for_kind(session, &prepared, kind)
+        .ok_or_else(|| LeafError::Render("Quad MPR state unavailable".into()))?;
+    let preview_size = slice_preview_dimensions_for_viewport(
+        tile_width,
+        tile_height,
+        &prepared,
+        kind.slice_mode().unwrap_or_default(),
+    );
+    let preview = {
+        let renderer = ensure_volume_renderer(session)?;
+        renderer.render_prepared_slice_preview(
+            &prepared,
+            &slice_state,
+            preview_size.0,
+            preview_size.1,
+            false,
+        )?
+    };
+    Ok(AdvancedViewportPreview {
+        width: preview.width,
+        height: preview.height,
+        image: leaf_ui::image_from_rgba8(preview.width, preview.height, preview.rgba)
+            .map_err(|error| LeafError::Render(error.to_string()))?,
+        info: quad_mpr_preview_info(kind, slice_state),
+    })
+}
+
+fn apply_quad_preview_to_viewer(
+    viewer: &leaf_ui::StudyViewerWindow,
+    kind: QuadViewportKind,
+    preview: &AdvancedViewportPreview,
+) {
+    match kind {
+        QuadViewportKind::Axial => {
+            viewer.set_quad_axial_image(preview.image.clone());
+            viewer.set_quad_axial_info(preview.info.clone().into());
+        }
+        QuadViewportKind::Coronal => {
+            viewer.set_quad_coronal_image(preview.image.clone());
+            viewer.set_quad_coronal_info(preview.info.clone().into());
+        }
+        QuadViewportKind::Sagittal => {
+            viewer.set_quad_sagittal_image(preview.image.clone());
+            viewer.set_quad_sagittal_info(preview.info.clone().into());
+        }
+        QuadViewportKind::Dvr => {
+            viewer.set_quad_dvr_image(preview.image.clone());
+            viewer.set_quad_dvr_info(preview.info.clone().into());
+        }
+    }
+}
+
+fn render_quad_single_preview(
+    session: &mut ViewerSession,
+    kind: QuadViewportKind,
+    interactive: bool,
+) -> LeafResult<()> {
+    let preview = render_quad_preview_for_kind(session, kind, interactive)?;
+    session.quad_previews_by_kind.insert(kind, preview.clone());
+    session.volume_preview_active = true;
+    let viewer = session
+        .viewer
+        .upgrade()
+        .ok_or_else(|| LeafError::Render("Viewer window no longer available".into()))?;
+    apply_quad_preview_to_viewer(&viewer, kind, &preview);
+    viewer.set_connection_status(
+        "Local imagebox | Quad MPR/DVR (select tile, wheel=slice/zoom, right-click=crosshair)"
+            .into(),
+    );
+    rebuild_quad_reference_lines(session)?;
+    apply_viewport_state(session)?;
+    update_measurements_model(session)?;
+    Ok(())
+}
+
+fn render_quad_mpr_previews(session: &mut ViewerSession) -> LeafResult<()> {
+    let viewer = session
+        .viewer
+        .upgrade()
+        .ok_or_else(|| LeafError::Render("Viewer window no longer available".into()))?;
+    for kind in [
+        QuadViewportKind::Axial,
+        QuadViewportKind::Coronal,
+        QuadViewportKind::Sagittal,
+    ] {
+        let preview = render_quad_preview_for_kind(session, kind, false)?;
+        apply_quad_preview_to_viewer(&viewer, kind, &preview);
+        session.quad_previews_by_kind.insert(kind, preview);
+    }
+    session.volume_preview_active = true;
+    viewer.set_connection_status(
+        "Local imagebox | Quad MPR/DVR (select tile, wheel=slice/zoom, right-click=crosshair)"
+            .into(),
+    );
+    rebuild_quad_reference_lines(session)?;
+    apply_viewport_state(session)?;
+    update_measurements_model(session)?;
+    Ok(())
+}
+
+fn render_quad_volume_preview(session: &mut ViewerSession) -> LeafResult<()> {
+    let viewer = session
+        .viewer
+        .upgrade()
+        .ok_or_else(|| LeafError::Render("Viewer window no longer available".into()))?;
+    for kind in QuadViewportKind::ALL {
+        let preview = render_quad_preview_for_kind(session, kind, false)?;
+        apply_quad_preview_to_viewer(&viewer, kind, &preview);
+        session.quad_previews_by_kind.insert(kind, preview);
+    }
+    session.volume_preview_active = true;
+    viewer.set_connection_status(
+        "Local imagebox | Quad MPR/DVR (select tile, wheel=slice/zoom, right-click=crosshair)"
+            .into(),
+    );
+    rebuild_quad_reference_lines(session)?;
+    apply_viewport_state(session)?;
+    update_measurements_model(session)?;
+    Ok(())
+}
+
 fn ensure_volume_renderer(session: &mut ViewerSession) -> LeafResult<&mut VolumePreviewRenderer> {
     if session.volume_renderer.is_none() {
         session.volume_renderer = Some(VolumePreviewRenderer::new()?);
@@ -2032,14 +4043,14 @@ fn active_series_file_paths(session: &ViewerSession) -> LeafResult<Vec<String>> 
     Ok(file_paths)
 }
 
-fn preview_dimensions(session: &ViewerSession) -> (u32, u32) {
-    let mut width = if session.viewport_width > 0.0 {
-        session.viewport_width.round() as u32
+fn preview_dimensions_for_viewport(viewport_width: f32, viewport_height: f32) -> (u32, u32) {
+    let mut width = if viewport_width > 0.0 {
+        viewport_width.round() as u32
     } else {
         768
     };
-    let mut height = if session.viewport_height > 0.0 {
-        session.viewport_height.round() as u32
+    let mut height = if viewport_height > 0.0 {
+        viewport_height.round() as u32
     } else {
         768
     };
@@ -2056,6 +4067,54 @@ fn preview_dimensions(session: &ViewerSession) -> (u32, u32) {
     }
 
     (width, height)
+}
+
+fn preview_dimensions(session: &ViewerSession) -> (u32, u32) {
+    preview_dimensions_for_viewport(session.viewport_width, session.viewport_height)
+}
+
+fn fit_dimensions_to_aspect(max_width: u32, max_height: u32, aspect_ratio: f64) -> (u32, u32) {
+    let safe_aspect = aspect_ratio.max(0.1);
+    let mut width = max_width.max(128) as f64;
+    let mut height = max_height.max(128) as f64;
+    if width / height > safe_aspect {
+        width = height * safe_aspect;
+    } else {
+        height = width / safe_aspect;
+    }
+    (
+        width.round().max(128.0) as u32,
+        height.round().max(128.0) as u32,
+    )
+}
+
+fn slice_preview_dimensions(
+    session: &ViewerSession,
+    prepared: &PreparedVolume,
+    mode: SlicePreviewMode,
+) -> (u32, u32) {
+    slice_preview_dimensions_for_viewport(
+        session.viewport_width,
+        session.viewport_height,
+        prepared,
+        mode,
+    )
+}
+
+fn slice_preview_dimensions_for_viewport(
+    viewport_width: f32,
+    viewport_height: f32,
+    prepared: &PreparedVolume,
+    mode: SlicePreviewMode,
+) -> (u32, u32) {
+    let (max_width, max_height) = preview_dimensions_for_viewport(viewport_width, viewport_height);
+    let size = prepared.world_bounds().size();
+    let (plane_width, plane_height) = match mode {
+        SlicePreviewMode::Axial => (size.x.max(1.0), size.y.max(1.0)),
+        SlicePreviewMode::Coronal => (size.x.max(1.0), size.z.max(1.0)),
+        SlicePreviewMode::Sagittal => (size.y.max(1.0), size.z.max(1.0)),
+    };
+    fit_dimensions_to_aspect(max_width, max_height, plane_width / plane_height)
 }
 
 fn show_volume_preview(
@@ -2075,11 +4134,19 @@ fn show_volume_preview(
         leaf_ui::image_from_rgba8(preview.width, preview.height, preview.rgba.clone())
             .map_err(|error| LeafError::Render(error.to_string()))?,
     );
-    viewer.set_connection_status(
-        "Local imagebox | DVR preview (drag=orbit, Pan/Zoom tools=3D)".into(),
-    );
-    viewer.set_window_info("DVR preview".into());
-    viewer.set_slice_info("3D".into());
+    if session.advanced_preview_mode.is_dvr() {
+        viewer.set_connection_status(
+            "Local imagebox | DVR preview (drag=orbit, Pan/Zoom tools=3D)".into(),
+        );
+        viewer.set_window_info("DVR preview".into());
+        viewer.set_slice_info("3D".into());
+    } else {
+        viewer.set_connection_status(
+            "Local imagebox | MPR preview (wheel=slice, W/L/Pan/Zoom tools active)".into(),
+        );
+        viewer.set_window_info("MPR preview".into());
+        viewer.set_slice_info(format!("MPR {}", session.advanced_preview_mode.label()).into());
+    }
     apply_viewport_state(session)?;
     update_measurements_model(session)?;
     Ok(())
@@ -2311,6 +4378,7 @@ fn generate_thumbnail_rgba(instances: &[InstanceInfo]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::DVec3;
     use leaf_core::domain::{SeriesUid, SopInstanceUid, StudyUid};
     use leaf_tools::measurement::Measurement;
 
@@ -2389,6 +4457,19 @@ mod tests {
     }
 
     #[test]
+    fn mpr_viewport_mapping_uses_top_down_slice_uv_space() {
+        let geometry = displayed_image_geometry(800.0, 600.0, 512, 256, 1.0, 0.0, 0.0).unwrap();
+
+        let top_left = mpr_uv_from_viewport(geometry, 0.0, 100.0).unwrap();
+        assert!((top_left.x - 0.0).abs() < 0.001);
+        assert!((top_left.y - 0.0).abs() < 0.001);
+
+        let bottom_right = mpr_uv_from_viewport(geometry, 800.0, 500.0).unwrap();
+        assert!((bottom_right.x - 1.0).abs() < 0.001);
+        assert!((bottom_right.y - 1.0).abs() < 0.001);
+    }
+
+    #[test]
     fn transform_mapping_round_trips_for_rotated_flipped_images() {
         let transform = ImageTransformState {
             rotation_quarters: 1,
@@ -2435,6 +4516,9 @@ mod tests {
             active_frame_index: 0,
             measurement_panel_visible: false,
             volume_preview_active: false,
+            quad_viewport_active: false,
+            advanced_preview_mode: AdvancedPreviewMode::default(),
+            focused_quad_viewport: AdvancedPreviewMode::default().quad_viewport(),
             active_tool: leaf_ui::ViewerTool::WindowLevel,
             viewport_scale: 1.0,
             viewport_offset_x: 0.0,
@@ -2462,11 +4546,25 @@ mod tests {
             volume_renderer: None,
             prepared_volumes_by_series: HashMap::new(),
             volume_view_state_by_series: HashMap::new(),
+            slice_view_state_by_series: HashMap::new(),
+            quad_previews_by_kind: HashMap::new(),
+            quad_reference_lines_by_kind: HashMap::new(),
+            quad_reference_hover: None,
+            quad_reference_drag: None,
         };
 
         let preview = preview_dimensions(&session);
 
         assert_eq!(preview.0.max(preview.1), 640);
+    }
+
+    #[test]
+    fn fit_dimensions_preserves_requested_aspect_ratio() {
+        let fitted = fit_dimensions_to_aspect(640, 480, 2.0);
+        assert_eq!(fitted, (640, 320));
+
+        let fitted_tall = fit_dimensions_to_aspect(640, 480, 0.5);
+        assert_eq!(fitted_tall, (240, 480));
     }
 
     #[test]
@@ -2518,5 +4616,94 @@ mod tests {
         assert_eq!(&rgba[top_left..top_left + 4], &OVERLAY_COLOR);
         assert_eq!(&rgba[bottom_right..bottom_right + 4], &OVERLAY_COLOR);
         assert_eq!(&rgba[top_right..top_right + 4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn volume_blend_mode_cycles_through_supported_modes() {
+        assert_eq!(
+            next_volume_blend_mode(VolumeBlendMode::Composite),
+            VolumeBlendMode::MaximumIntensity
+        );
+        assert_eq!(
+            next_volume_blend_mode(VolumeBlendMode::MaximumIntensity),
+            VolumeBlendMode::MinimumIntensity
+        );
+        assert_eq!(
+            next_volume_blend_mode(VolumeBlendMode::MinimumIntensity),
+            VolumeBlendMode::AverageIntensity
+        );
+        assert_eq!(
+            next_volume_blend_mode(VolumeBlendMode::AverageIntensity),
+            VolumeBlendMode::Composite
+        );
+    }
+
+    #[test]
+    fn quad_reference_lines_pass_through_shared_crosshair() {
+        let plane = SlicePlane::new(DVec3::ZERO, DVec3::X, DVec3::Y, 10.0, 10.0);
+        let other_plane =
+            SlicePlane::new(DVec3::new(2.0, 0.0, 0.0), DVec3::Y, DVec3::Z, 10.0, 10.0);
+        let shared_world = DVec3::new(2.0, 3.0, 0.0);
+        let geometry = ViewportGeometry {
+            image_origin_x: 0.0,
+            image_origin_y: 0.0,
+            image_width: 100.0,
+            image_height: 100.0,
+        };
+
+        let overlay = quad_reference_line_for_plane(
+            &plane,
+            &other_plane,
+            QuadViewportKind::Coronal,
+            shared_world,
+            geometry,
+        )
+        .expect("reference line should exist");
+        let (shared_x, shared_y) = quad_world_to_viewport_point(&plane, geometry, shared_world);
+
+        assert!(
+            point_to_segment_distance_sq(
+                shared_x,
+                shared_y,
+                overlay.start_x,
+                overlay.start_y,
+                overlay.end_x,
+                overlay.end_y,
+            ) < 1.0e-3
+        );
+    }
+
+    #[test]
+    fn slice_plane_orientation_labels_follow_plane_axes() {
+        let plane = SlicePlane::new(DVec3::ZERO, DVec3::X, DVec3::Y, 10.0, 10.0);
+        let (top, bottom, left, right) = orientation_labels_for_slice_plane(&plane);
+
+        assert_eq!(top, "A");
+        assert_eq!(bottom, "P");
+        assert_eq!(left, "R");
+        assert_eq!(right, "L");
+    }
+
+    #[test]
+    fn slice_plane_angles_follow_plane_basis_instead_of_screen_y() {
+        let plane = SlicePlane::new(DVec3::ZERO, DVec3::X, -DVec3::Z, 10.0, 10.0);
+        let right = DVec3::X;
+        let top = DVec3::Z;
+        let bottom = -DVec3::Z;
+
+        let angle_for = |world: DVec3| {
+            let offset = world - DVec3::ZERO;
+            offset.dot(plane.up).atan2(offset.dot(plane.right))
+        };
+
+        assert!((angle_for(right) - 0.0).abs() < 1.0e-6);
+        assert!((angle_for(top) + std::f64::consts::FRAC_PI_2).abs() < 1.0e-6);
+        assert!((angle_for(bottom) - std::f64::consts::FRAC_PI_2).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn normalized_angle_delta_chooses_shortest_rotation() {
+        let delta = normalized_angle_delta(-std::f64::consts::PI + 0.1, std::f64::consts::PI - 0.1);
+        assert!((delta - 0.2).abs() < 1.0e-6);
     }
 }

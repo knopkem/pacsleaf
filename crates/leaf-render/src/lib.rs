@@ -7,6 +7,8 @@ pub mod lut;
 pub mod viewport;
 pub mod volume;
 
+pub use volren_core::SlicePlane;
 pub use volume::{
-    PreparedVolume, VolumeBlendMode, VolumePreviewImage, VolumePreviewRenderer, VolumeViewState,
+    PreparedVolume, SlicePreviewMode, SlicePreviewState, SliceProjectionMode, VolumeBlendMode,
+    VolumePreviewImage, VolumePreviewRenderer, VolumeViewState,
 };
