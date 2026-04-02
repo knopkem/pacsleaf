@@ -53,7 +53,7 @@ jobs:
             pacsleaf -> pacsleaf/target
       - name: Cargo check
         working-directory: pacsleaf
-        run: cargo check --workspace --all-targets --locked
+        run: cargo check --workspace --all-targets
 
   test:
     name: Test (${{ matrix.os }})
@@ -98,7 +98,7 @@ jobs:
             pacsleaf -> pacsleaf/target
       - name: Cargo test
         working-directory: pacsleaf
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --all-targets
 
   fmt:
     name: Format
@@ -162,4 +162,4 @@ jobs:
             pacsleaf -> pacsleaf/target
       - name: Cargo clippy
         working-directory: pacsleaf
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings

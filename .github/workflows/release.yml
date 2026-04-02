@@ -77,7 +77,7 @@ jobs:
 
       - name: Build binary
         working-directory: pacsleaf
-        run: cargo build --locked --release --target ${{ matrix.target }} -p leaf-app --bin pacsleaf
+        run: cargo build --release --target ${{ matrix.target }} -p leaf-app --bin pacsleaf
 
       - name: Package binary (unix)
         if: runner.os != 'Windows'
