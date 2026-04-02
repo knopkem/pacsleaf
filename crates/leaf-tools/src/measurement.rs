@@ -168,7 +168,10 @@ impl Measurement {
                 center,
                 radius_x,
                 radius_y,
-            } => vec![*center, DVec2::new(center.x + radius_x, center.y + radius_y)],
+            } => vec![
+                *center,
+                DVec2::new(center.x + radius_x, center.y + radius_y),
+            ],
             _ => vec![],
         }
     }
@@ -196,25 +199,45 @@ impl Measurement {
                 *arm2 = pos;
                 true
             }
-            (MeasurementKind::RectangleRoi {
-                top_left,
-                bottom_right,
-            }, idx) => match idx {
-                0 => { *top_left = pos; true }
-                1 => { top_left.y = pos.y; bottom_right.x = pos.x; true }
-                2 => { *bottom_right = pos; true }
-                3 => { top_left.x = pos.x; bottom_right.y = pos.y; true }
+            (
+                MeasurementKind::RectangleRoi {
+                    top_left,
+                    bottom_right,
+                },
+                idx,
+            ) => match idx {
+                0 => {
+                    *top_left = pos;
+                    true
+                }
+                1 => {
+                    top_left.y = pos.y;
+                    bottom_right.x = pos.x;
+                    true
+                }
+                2 => {
+                    *bottom_right = pos;
+                    true
+                }
+                3 => {
+                    top_left.x = pos.x;
+                    bottom_right.y = pos.y;
+                    true
+                }
                 _ => false,
             },
             (MeasurementKind::EllipseRoi { center, .. }, 0) => {
                 *center = pos;
                 true
             }
-            (MeasurementKind::EllipseRoi {
-                center,
-                radius_x,
-                radius_y,
-            }, 1) => {
+            (
+                MeasurementKind::EllipseRoi {
+                    center,
+                    radius_x,
+                    radius_y,
+                },
+                1,
+            ) => {
                 *radius_x = (pos.x - center.x).abs().max(1.0);
                 *radius_y = (pos.y - center.y).abs().max(1.0);
                 true

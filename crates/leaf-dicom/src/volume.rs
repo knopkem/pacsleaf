@@ -258,7 +258,9 @@ fn decode_modality_voxels(
 ) -> LeafResult<Vec<i16>> {
     let bits_allocated = ds.get_u16(tags::BITS_ALLOCATED).unwrap_or(16);
     let bits_stored = ds.get_u16(tags::BITS_STORED).unwrap_or(bits_allocated);
-    let high_bit = ds.get_u16(tags::HIGH_BIT).unwrap_or(bits_stored.saturating_sub(1));
+    let high_bit = ds
+        .get_u16(tags::HIGH_BIT)
+        .unwrap_or(bits_stored.saturating_sub(1));
     let pixel_representation = match ds.get_u16(tags::PIXEL_REPRESENTATION).unwrap_or(0) {
         1 => PixelRepresentation::Signed,
         _ => PixelRepresentation::Unsigned,

@@ -301,7 +301,7 @@ impl VolumePreviewRenderer {
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("pacsleaf_volume_preview_encoder"),
-            });
+                });
             clear_render_target(&mut encoder, &view);
             let viewport = Viewport::full(width, height);
             if interactive {
@@ -362,10 +362,9 @@ impl VolumePreviewRenderer {
     }
 
     fn ensure_preview_target(&mut self, width: u32, height: u32) {
-        let needs_rebuild = self
-            .preview_target
-            .as_ref()
-            .map_or(true, |target| target.width != width || target.height != height);
+        let needs_rebuild = self.preview_target.as_ref().map_or(true, |target| {
+            target.width != width || target.height != height
+        });
         if !needs_rebuild {
             return;
         }
@@ -551,8 +550,7 @@ fn camera_for_state(volume: &DynVolume, view_state: &VolumeViewState) -> Camera 
     // Pan in the view plane, scaled to current distance for consistent
     // screen-space feel at any zoom level.
     let pan_scale = distance * 0.001;
-    let pan_offset = right * (-view_state.pan_x * pan_scale)
-        + up * (-view_state.pan_y * pan_scale);
+    let pan_offset = right * (-view_state.pan_x * pan_scale) + up * (-view_state.pan_y * pan_scale);
 
     Camera::new(position + pan_offset, center + pan_offset, up)
         .with_projection(Projection::Perspective { fov_y_deg })
@@ -611,7 +609,11 @@ fn interactive_downsample_factor(width: u32, height: u32) -> u32 {
     2
 }
 
-fn resolved_transfer_window(view_state: VolumeViewState, scalar_min: f64, scalar_max: f64) -> (f64, f64) {
+fn resolved_transfer_window(
+    view_state: VolumeViewState,
+    scalar_min: f64,
+    scalar_max: f64,
+) -> (f64, f64) {
     let range = (scalar_max - scalar_min).max(1.0);
     let default_center = if looks_ct_like(scalar_min, scalar_max) {
         90.0
@@ -689,7 +691,10 @@ fn kpacs_soft_tissue_color_transfer_function(
     for index in 0..samples {
         let t = index as f64 / (samples - 1) as f64;
         let scalar = scalar_min + span * t;
-        color_tf.add_point(scalar, sample_kpacs_auto_ct_color(scalar, center, width, 0.72));
+        color_tf.add_point(
+            scalar,
+            sample_kpacs_auto_ct_color(scalar, center, width, 0.72),
+        );
     }
     color_tf
 }
@@ -701,8 +706,9 @@ fn sample_kpacs_auto_ct_color(
     color_strength: f64,
 ) -> [f64; 3] {
     let safe_focus_width = focus_width.max(1.0);
-    let target_luminance =
-        ((scalar_value - (focus_center - safe_focus_width * 0.5)) / safe_focus_width).clamp(0.0, 1.0);
+    let target_luminance = ((scalar_value - (focus_center - safe_focus_width * 0.5))
+        / safe_focus_width)
+        .clamp(0.0, 1.0);
     let base_color = interpolate_ct_anchor_color(scalar_value);
     let matched_color = match_luminance(base_color, target_luminance);
     let focus_distance = (scalar_value - focus_center).abs() / safe_focus_width;

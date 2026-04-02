@@ -1,0 +1,165 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: pacsleaf
+      - uses: actions/checkout@v4
+        with:
+          repository: knopkem/dicom-toolkit-rs
+          path: dicom-toolkit-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: knopkem/volren-rs
+          path: volren-rs
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libegl1-mesa-dev \
+            libfontconfig1-dev \
+            libgtk-3-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb1-dev \
+            libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            pacsleaf -> pacsleaf/target
+      - name: Cargo check
+        working-directory: pacsleaf
+        run: cargo check --workspace --all-targets --locked
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: pacsleaf
+      - uses: actions/checkout@v4
+        with:
+          repository: knopkem/dicom-toolkit-rs
+          path: dicom-toolkit-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: knopkem/volren-rs
+          path: volren-rs
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libegl1-mesa-dev \
+            libfontconfig1-dev \
+            libgtk-3-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb1-dev \
+            libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            pacsleaf -> pacsleaf/target
+      - name: Cargo test
+        working-directory: pacsleaf
+        run: cargo test --workspace --all-targets --locked
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: pacsleaf
+      - uses: actions/checkout@v4
+        with:
+          repository: knopkem/dicom-toolkit-rs
+          path: dicom-toolkit-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: knopkem/volren-rs
+          path: volren-rs
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Cargo fmt
+        working-directory: pacsleaf
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: pacsleaf
+      - uses: actions/checkout@v4
+        with:
+          repository: knopkem/dicom-toolkit-rs
+          path: dicom-toolkit-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: knopkem/volren-rs
+          path: volren-rs
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libegl1-mesa-dev \
+            libfontconfig1-dev \
+            libgtk-3-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb1-dev \
+            libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            pacsleaf -> pacsleaf/target
+      - name: Cargo clippy
+        working-directory: pacsleaf
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

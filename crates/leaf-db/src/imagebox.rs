@@ -213,7 +213,9 @@ impl Imagebox {
         let txn = self.db.begin_write().map_err(db_err)?;
         {
             let mut table = txn.open_table(MEASUREMENTS).map_err(db_err)?;
-            table.insert(series_uid, measurements_json).map_err(db_err)?;
+            table
+                .insert(series_uid, measurements_json)
+                .map_err(db_err)?;
         }
         txn.commit().map_err(db_err)?;
         Ok(())

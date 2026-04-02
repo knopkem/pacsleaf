@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: pacsleaf
+            asset_name: pacsleaf-linux-x86_64.tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: pacsleaf
+            asset_name: pacsleaf-macos-x86_64.tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary: pacsleaf
+            asset_name: pacsleaf-macos-aarch64.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: pacsleaf.exe
+            asset_name: pacsleaf-windows-x86_64.zip
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: pacsleaf
+      - uses: actions/checkout@v4
+        with:
+          repository: knopkem/dicom-toolkit-rs
+          path: dicom-toolkit-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: knopkem/volren-rs
+          path: volren-rs
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libegl1-mesa-dev \
+            libfontconfig1-dev \
+            libgtk-3-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb1-dev \
+            libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+          workspaces: |
+            pacsleaf -> pacsleaf/target
+
+      - name: Build binary
+        working-directory: pacsleaf
+        run: cargo build --locked --release --target ${{ matrix.target }} -p leaf-app --bin pacsleaf
+
+      - name: Package binary (unix)
+        if: runner.os != 'Windows'
+        working-directory: pacsleaf
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.binary }}"
+          tar -C dist -czf "${{ matrix.asset_name }}" "${{ matrix.binary }}"
+
+      - name: Package binary (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: pacsleaf
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.binary }}"
+          Compress-Archive -Path "dist/${{ matrix.binary }}" -DestinationPath "${{ matrix.asset_name }}" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: pacsleaf/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: dist/*
+          generate_release_notes: true

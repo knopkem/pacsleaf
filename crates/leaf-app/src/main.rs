@@ -8,12 +8,11 @@ mod viewer;
 
 use anyhow::Result;
 use browser::{
-    apply_browser_settings, apply_window_geometry, capture_window_geometry,
-    default_dimse_port, default_local_ae_title, find_node, load_browser_settings,
-    load_window_geometry, parse_remote_study_ref, qido_first_int, qido_first_string,
-    refresh_browser, save_browser_settings, save_window_geometry, validate_browser_settings,
-    BrowserQuery, BrowserSettings, RemoteStudyRef, BROWSER_WINDOW_GEOMETRY_KEY,
-    VIEWER_WINDOW_GEOMETRY_KEY,
+    apply_browser_settings, apply_window_geometry, capture_window_geometry, default_dimse_port,
+    default_local_ae_title, find_node, load_browser_settings, load_window_geometry,
+    parse_remote_study_ref, qido_first_int, qido_first_string, refresh_browser,
+    save_browser_settings, save_window_geometry, validate_browser_settings, BrowserQuery,
+    BrowserSettings, RemoteStudyRef, BROWSER_WINDOW_GEOMETRY_KEY, VIEWER_WINDOW_GEOMETRY_KEY,
 };
 use image::load_from_memory;
 use leaf_core::config::{data_dir, PacsNodeConfig};
@@ -331,8 +330,7 @@ fn main() -> Result<()> {
     // Run the application.
     browser.run()?;
     if let Some(geometry) = capture_window_geometry(browser.window()) {
-        if let Err(error) =
-            save_window_geometry(&imagebox, BROWSER_WINDOW_GEOMETRY_KEY, &geometry)
+        if let Err(error) = save_window_geometry(&imagebox, BROWSER_WINDOW_GEOMETRY_KEY, &geometry)
         {
             info!("Failed to save browser window geometry: {}", error);
         }
@@ -614,11 +612,9 @@ fn open_remote_viewer_for_study(
     viewer.window().on_close_requested(move || {
         if let Some(viewer) = viewer_weak_for_close.upgrade() {
             if let Some(geometry) = capture_window_geometry(viewer.window()) {
-                if let Err(error) = save_window_geometry(
-                    &imagebox_for_close,
-                    VIEWER_WINDOW_GEOMETRY_KEY,
-                    &geometry,
-                ) {
+                if let Err(error) =
+                    save_window_geometry(&imagebox_for_close, VIEWER_WINDOW_GEOMETRY_KEY, &geometry)
+                {
                     info!("Failed to save viewer window geometry: {}", error);
                 }
             }
