@@ -156,19 +156,22 @@ pub struct SlicePreviewState {
     pub crosshair_world: Option<DVec3>,
     pub transfer_center_hu: Option<f64>,
     pub transfer_width_hu: Option<f64>,
+    slab_settings_by_mode: [SliceSlabSettings; 3],
 }
 
 impl Default for SlicePreviewState {
     fn default() -> Self {
+        let slab_settings = [SliceSlabSettings::default(); 3];
         Self {
             mode: SlicePreviewMode::Axial,
             offset: 0.0,
             orientation: DQuat::IDENTITY,
-            projection_mode: SliceProjectionMode::Thin,
-            slab_half_thickness: 0.0,
+            projection_mode: slab_settings[0].projection_mode,
+            slab_half_thickness: slab_settings[0].slab_half_thickness,
             crosshair_world: None,
             transfer_center_hu: None,
             transfer_width_hu: None,
+            slab_settings_by_mode: slab_settings,
         }
     }
 }
@@ -203,14 +206,19 @@ impl SlicePreviewState {
     pub fn reset(&mut self) {
         self.offset = 0.0;
         self.orientation = DQuat::IDENTITY;
+        self.projection_mode = SliceProjectionMode::Thin;
+        self.slab_half_thickness = 0.0;
         self.crosshair_world = None;
         self.transfer_center_hu = None;
         self.transfer_width_hu = None;
+        self.slab_settings_by_mode = [SliceSlabSettings::default(); 3];
     }
 
     /// Switch to a new orthogonal slice mode.
     pub fn set_mode(&mut self, mode: SlicePreviewMode) {
+        self.persist_current_slab_settings();
         self.mode = mode;
+        self.restore_current_slab_settings();
     }
 
     /// Resolve the current slice plane against a prepared volume bound.
@@ -257,6 +265,26 @@ impl SlicePreviewState {
         } else {
             default_half_thickness.max(0.5)
         };
+        self.persist_current_slab_settings();
+    }
+
+    /// Update the current mode's slab thickness from a drag handle.
+    pub fn set_slab_half_thickness_from_drag(
+        &mut self,
+        half_thickness: f64,
+        min_active_half_thickness: f64,
+        fallback_mode: SliceProjectionMode,
+    ) {
+        if half_thickness <= min_active_half_thickness {
+            self.projection_mode = SliceProjectionMode::Thin;
+            self.slab_half_thickness = 0.0;
+        } else {
+            if matches!(self.projection_mode, SliceProjectionMode::Thin) {
+                self.projection_mode = fallback_mode;
+            }
+            self.slab_half_thickness = half_thickness.max(0.5);
+        }
+        self.persist_current_slab_settings();
     }
 
     /// Resolve thick-slab parameters for the current projection mode.
@@ -293,6 +321,42 @@ impl SlicePreviewState {
         let rotation = DQuat::from_axis_angle(axis.normalize_or(DVec3::Z), angle_rad);
         self.orientation = (rotation * self.orientation).normalize();
         self.center_on_crosshair(bounds);
+    }
+
+    fn persist_current_slab_settings(&mut self) {
+        self.slab_settings_by_mode[mode_index(self.mode)] = SliceSlabSettings {
+            projection_mode: self.projection_mode,
+            slab_half_thickness: self.slab_half_thickness,
+        };
+    }
+
+    fn restore_current_slab_settings(&mut self) {
+        let settings = self.slab_settings_by_mode[mode_index(self.mode)];
+        self.projection_mode = settings.projection_mode;
+        self.slab_half_thickness = settings.slab_half_thickness;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SliceSlabSettings {
+    projection_mode: SliceProjectionMode,
+    slab_half_thickness: f64,
+}
+
+impl Default for SliceSlabSettings {
+    fn default() -> Self {
+        Self {
+            projection_mode: SliceProjectionMode::Thin,
+            slab_half_thickness: 0.0,
+        }
+    }
+}
+
+fn mode_index(mode: SlicePreviewMode) -> usize {
+    match mode {
+        SlicePreviewMode::Axial => 0,
+        SlicePreviewMode::Coronal => 1,
+        SlicePreviewMode::Sagittal => 2,
     }
 }
 
@@ -1391,6 +1455,40 @@ mod tests {
         assert_eq!(state.projection_mode, SliceProjectionMode::MaximumIntensity);
         assert_eq!(state.slab_half_thickness, 6.0);
         assert!(state.thick_slab().is_some());
+    }
+
+    #[test]
+    fn slice_projection_mode_is_remembered_per_mpr_axis() {
+        let mut state = SlicePreviewState::default();
+        state.cycle_projection_mode(6.0);
+        assert_eq!(state.projection_mode, SliceProjectionMode::MaximumIntensity);
+        assert_eq!(state.slab_half_thickness, 6.0);
+
+        state.set_mode(SlicePreviewMode::Coronal);
+        assert_eq!(state.projection_mode, SliceProjectionMode::Thin);
+        assert_eq!(state.slab_half_thickness, 0.0);
+
+        state.cycle_projection_mode(10.0);
+        state.cycle_projection_mode(10.0);
+        assert_eq!(state.projection_mode, SliceProjectionMode::MinimumIntensity);
+        assert_eq!(state.slab_half_thickness, 10.0);
+
+        state.set_mode(SlicePreviewMode::Axial);
+        assert_eq!(state.projection_mode, SliceProjectionMode::MaximumIntensity);
+        assert_eq!(state.slab_half_thickness, 6.0);
+    }
+
+    #[test]
+    fn slice_slab_drag_can_enable_and_disable_thick_slab() {
+        let mut state = SlicePreviewState::default();
+
+        state.set_slab_half_thickness_from_drag(8.0, 0.5, SliceProjectionMode::MaximumIntensity);
+        assert_eq!(state.projection_mode, SliceProjectionMode::MaximumIntensity);
+        assert_eq!(state.slab_half_thickness, 8.0);
+
+        state.set_slab_half_thickness_from_drag(0.1, 0.5, SliceProjectionMode::MaximumIntensity);
+        assert_eq!(state.projection_mode, SliceProjectionMode::Thin);
+        assert_eq!(state.slab_half_thickness, 0.0);
     }
 
     #[test]

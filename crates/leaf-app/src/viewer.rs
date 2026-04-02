@@ -262,7 +262,12 @@ struct QuadReferenceLineOverlay {
     handle1_y: f32,
     handle2_x: f32,
     handle2_y: f32,
+    handle3_x: f32,
+    handle3_y: f32,
+    handle4_x: f32,
+    handle4_y: f32,
     source_kind: QuadViewportKind,
+    slab_active: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -270,6 +275,7 @@ enum QuadReferenceTarget {
     Center,
     TranslateLine(QuadViewportKind),
     RotateLine(QuadViewportKind),
+    AdjustSlab(QuadViewportKind),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -295,6 +301,10 @@ enum QuadReferenceDrag {
         line_kind: QuadViewportKind,
         start_angle_rad: f64,
         start_orientation: DQuat,
+    },
+    AdjustSlab {
+        view: QuadViewportKind,
+        line_kind: QuadViewportKind,
     },
 }
 
@@ -1141,6 +1151,14 @@ pub(crate) fn open_viewer_for_study(
                             return;
                         }
                     }
+                    QuadReferenceTarget::AdjustSlab(line_kind) => {
+                        session.quad_reference_drag = Some(QuadReferenceDrag::AdjustSlab {
+                            view: kind,
+                            line_kind,
+                        });
+                        let _ = apply_viewport_state(&session);
+                        return;
+                    }
                     QuadReferenceTarget::TranslateLine(line_kind) => {
                         let drag = session
                             .prepared_volumes_by_series
@@ -1391,6 +1409,50 @@ pub(crate) fn open_viewer_for_study(
                         }
                     })
                     .unwrap_or(Ok(()))
+                }
+                QuadReferenceDrag::AdjustSlab { view, line_kind } => {
+                    if view != kind {
+                        return;
+                    }
+                    let slab_drag = session
+                        .prepared_volumes_by_series
+                        .get(&session.active_series_uid)
+                        .and_then(|prepared| {
+                            let bounds = prepared.world_bounds();
+                            let pointer_world = quad_mpr_world_point_from_viewport(
+                                &session,
+                                kind,
+                                x,
+                                y,
+                                viewport_width,
+                                viewport_height,
+                            )?;
+                            let current_state =
+                                quad_slice_view_state_for_kind(&session, prepared, kind)?;
+                            let other_state =
+                                quad_slice_view_state_for_kind(&session, prepared, line_kind)?;
+                            let thickness = (pointer_world - current_state.crosshair_world(bounds))
+                                .dot(other_state.slice_plane(bounds).normal())
+                                .abs();
+                            let slice_mode = line_kind.slice_mode()?;
+                            let min_active_half_thickness =
+                                (prepared.slice_scroll_step(slice_mode) * 0.5).max(0.25);
+                            Some((slice_mode, thickness, min_active_half_thickness))
+                        });
+                    if let Some((slice_mode, thickness, min_active_half_thickness)) = slab_drag {
+                        let slice_state = active_slice_view_state(&mut session);
+                        if slice_state.mode != slice_mode {
+                            slice_state.set_mode(slice_mode);
+                        }
+                        slice_state.set_slab_half_thickness_from_drag(
+                            thickness,
+                            min_active_half_thickness,
+                            SliceProjectionMode::MaximumIntensity,
+                        );
+                        render_quad_mpr_previews(&mut session)
+                    } else {
+                        Ok(())
+                    }
                 }
             };
             if let Err(error) = result {
@@ -1853,6 +1915,9 @@ fn layout_label(session: &ViewerSession) -> &'static str {
 fn set_selected_quad_viewport(session: &mut ViewerSession, kind: QuadViewportKind) {
     session.focused_quad_viewport = kind;
     session.advanced_preview_mode = kind.advanced_preview_mode();
+    if let Some(slice_mode) = kind.slice_mode() {
+        active_slice_view_state(session).set_mode(slice_mode);
+    }
 }
 
 fn quad_preview(
@@ -1964,10 +2029,13 @@ fn clip_line_to_geometry(
 fn quad_reference_line_for_plane(
     current_plane: &SlicePlane,
     other_plane: &SlicePlane,
+    other_state: &SlicePreviewState,
     source_kind: QuadViewportKind,
     shared_world: glam::DVec3,
     geometry: ViewportGeometry,
 ) -> Option<QuadReferenceLineOverlay> {
+    const SLAB_HANDLE_MIN_OFFSET_PX: f32 = 14.0;
+
     let direction = current_plane.normal().cross(other_plane.normal());
     if direction.length_squared() <= 1.0e-10 {
         return None;
@@ -1984,8 +2052,61 @@ fn quad_reference_line_for_plane(
         dir_y - center_y,
         geometry,
     )?;
+    let line_dx = end_x - start_x;
+    let line_dy = end_y - start_y;
+    let line_length = (line_dx * line_dx + line_dy * line_dy).sqrt().max(1.0e-4);
+    let slab_active = !matches!(other_state.projection_mode, SliceProjectionMode::Thin)
+        && other_state.slab_half_thickness > 1.0e-4;
+    let actual_slab_offset = if slab_active {
+        let (slab_x, slab_y) = quad_world_to_viewport_point(
+            current_plane,
+            geometry,
+            shared_world + other_plane.normal() * other_state.slab_half_thickness,
+        );
+        (slab_x - center_x, slab_y - center_y)
+    } else {
+        (0.0, 0.0)
+    };
+    let actual_slab_offset_len = (actual_slab_offset.0 * actual_slab_offset.0
+        + actual_slab_offset.1 * actual_slab_offset.1)
+        .sqrt();
+    let slab_dir = if actual_slab_offset_len > 1.0e-4 {
+        (
+            actual_slab_offset.0 / actual_slab_offset_len,
+            actual_slab_offset.1 / actual_slab_offset_len,
+        )
+    } else {
+        (-line_dy / line_length, line_dx / line_length)
+    };
+    let slab_handle_offset_px = actual_slab_offset_len.max(SLAB_HANDLE_MIN_OFFSET_PX);
+    let slab_handle_offset = (
+        slab_dir.0 * slab_handle_offset_px,
+        slab_dir.1 * slab_handle_offset_px,
+    );
+    let mut commands = vec![format!(
+        "M {start_x:.1} {start_y:.1} L {end_x:.1} {end_y:.1}"
+    )];
+    if slab_active && actual_slab_offset_len > 0.5 {
+        for sign in [-1.0f32, 1.0] {
+            let offset_x = actual_slab_offset.0 * sign;
+            let offset_y = actual_slab_offset.1 * sign;
+            if let Some(((slab_start_x, slab_start_y), (slab_end_x, slab_end_y))) =
+                clip_line_to_geometry(
+                    center_x + offset_x,
+                    center_y + offset_y,
+                    dir_x - center_x,
+                    dir_y - center_y,
+                    geometry,
+                )
+            {
+                commands.push(format!(
+                    "M {slab_start_x:.1} {slab_start_y:.1} L {slab_end_x:.1} {slab_end_y:.1}"
+                ));
+            }
+        }
+    }
     Some(QuadReferenceLineOverlay {
-        commands: format!("M {start_x:.1} {start_y:.1} L {end_x:.1} {end_y:.1}"),
+        commands: commands.join(" "),
         start_x,
         start_y,
         end_x,
@@ -1994,7 +2115,12 @@ fn quad_reference_line_for_plane(
         handle1_y: (center_y + start_y) * 0.5,
         handle2_x: (center_x + end_x) * 0.5,
         handle2_y: (center_y + end_y) * 0.5,
+        handle3_x: center_x + slab_handle_offset.0,
+        handle3_y: center_y + slab_handle_offset.1,
+        handle4_x: center_x - slab_handle_offset.0,
+        handle4_y: center_y - slab_handle_offset.1,
         source_kind,
+        slab_active,
     })
 }
 
@@ -2038,6 +2164,7 @@ fn rebuild_quad_reference_lines(session: &mut ViewerSession) -> LeafResult<()> {
                         quad_reference_line_for_plane(
                             &current_plane,
                             &other_state.slice_plane(prepared.world_bounds()),
+                            &other_state,
                             other_kind,
                             shared_world,
                             geometry,
@@ -2194,6 +2321,38 @@ fn quad_reference_line_hit(
         });
     }
 
+    if let Some((_, source_kind)) = session
+        .quad_reference_lines_by_kind
+        .get(&kind)
+        .into_iter()
+        .flat_map(|lines| lines.iter())
+        .filter_map(|line| {
+            let distance_sq = point_to_segment_distance_sq(
+                x,
+                y,
+                line.handle3_x,
+                line.handle3_y,
+                line.handle3_x,
+                line.handle3_y,
+            )
+            .min(point_to_segment_distance_sq(
+                x,
+                y,
+                line.handle4_x,
+                line.handle4_y,
+                line.handle4_x,
+                line.handle4_y,
+            ));
+            (distance_sq <= HANDLE_THRESHOLD_SQ).then_some((distance_sq, line.source_kind))
+        })
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal))
+    {
+        return Some(QuadReferenceSelection {
+            view: kind,
+            target: QuadReferenceTarget::AdjustSlab(source_kind),
+        });
+    }
+
     session
         .quad_reference_lines_by_kind
         .get(&kind)
@@ -2224,7 +2383,25 @@ fn quad_reference_line_hit(
                 line.handle2_x,
                 line.handle2_y,
             ));
-            (line_distance_sq <= LINE_THRESHOLD_SQ && handle_distance_sq > HANDLE_THRESHOLD_SQ)
+            let slab_handle_distance_sq = point_to_segment_distance_sq(
+                x,
+                y,
+                line.handle3_x,
+                line.handle3_y,
+                line.handle3_x,
+                line.handle3_y,
+            )
+            .min(point_to_segment_distance_sq(
+                x,
+                y,
+                line.handle4_x,
+                line.handle4_y,
+                line.handle4_x,
+                line.handle4_y,
+            ));
+            (line_distance_sq <= LINE_THRESHOLD_SQ
+                && handle_distance_sq > HANDLE_THRESHOLD_SQ
+                && slab_handle_distance_sq > HANDLE_THRESHOLD_SQ)
                 .then_some((
                     line_distance_sq,
                     QuadReferenceSelection {
@@ -2252,6 +2429,10 @@ fn quad_reference_line_highlighted(
             view: drag_view,
             line_kind,
             ..
+        } | QuadReferenceDrag::AdjustSlab {
+            view: drag_view,
+            line_kind,
+            ..
         }) if (drag_view, line_kind) == (view, source_kind)
     );
     let hover_active = matches!(
@@ -2259,7 +2440,8 @@ fn quad_reference_line_highlighted(
         Some(QuadReferenceSelection {
             view: hover_view,
             target: QuadReferenceTarget::TranslateLine(line_kind)
-                | QuadReferenceTarget::RotateLine(line_kind),
+                | QuadReferenceTarget::RotateLine(line_kind)
+                | QuadReferenceTarget::AdjustSlab(line_kind),
         }) if (hover_view, line_kind) == (view, source_kind)
     );
     drag_active || hover_active
@@ -2387,8 +2569,13 @@ fn quad_reference_line_model(
             h1_y: overlay.handle1_y,
             h2_x: overlay.handle2_x,
             h2_y: overlay.handle2_y,
+            h3_x: overlay.handle3_x,
+            h3_y: overlay.handle3_y,
+            h4_x: overlay.handle4_x,
+            h4_y: overlay.handle4_y,
             kind: overlay.source_kind.index(),
             active: quad_reference_line_highlighted(session, kind, overlay.source_kind),
+            slab_active: overlay.slab_active,
         })
         .collect::<Vec<_>>();
     ModelRc::from(Rc::new(VecModel::from(entries)))
@@ -4643,6 +4830,8 @@ mod tests {
         let plane = SlicePlane::new(DVec3::ZERO, DVec3::X, DVec3::Y, 10.0, 10.0);
         let other_plane =
             SlicePlane::new(DVec3::new(2.0, 0.0, 0.0), DVec3::Y, DVec3::Z, 10.0, 10.0);
+        let mut other_state = SlicePreviewState::default();
+        other_state.set_mode(SlicePreviewMode::Coronal);
         let shared_world = DVec3::new(2.0, 3.0, 0.0);
         let geometry = ViewportGeometry {
             image_origin_x: 0.0,
@@ -4654,6 +4843,7 @@ mod tests {
         let overlay = quad_reference_line_for_plane(
             &plane,
             &other_plane,
+            &other_state,
             QuadViewportKind::Coronal,
             shared_world,
             geometry,
@@ -4670,6 +4860,58 @@ mod tests {
                 overlay.end_x,
                 overlay.end_y,
             ) < 1.0e-3
+        );
+    }
+
+    #[test]
+    fn thick_slab_reference_lines_add_perpendicular_handles_and_guides() {
+        let plane = SlicePlane::new(DVec3::ZERO, DVec3::X, DVec3::Y, 10.0, 10.0);
+        let other_plane = SlicePlane::new(DVec3::ZERO, DVec3::Y, DVec3::Z, 10.0, 10.0);
+        let mut other_state = SlicePreviewState::default();
+        other_state.set_mode(SlicePreviewMode::Coronal);
+        other_state.set_slab_half_thickness_from_drag(
+            2.0,
+            0.5,
+            SliceProjectionMode::MaximumIntensity,
+        );
+        let geometry = ViewportGeometry {
+            image_origin_x: 0.0,
+            image_origin_y: 0.0,
+            image_width: 100.0,
+            image_height: 100.0,
+        };
+
+        let overlay = quad_reference_line_for_plane(
+            &plane,
+            &other_plane,
+            &other_state,
+            QuadViewportKind::Coronal,
+            DVec3::ZERO,
+            geometry,
+        )
+        .expect("reference line should exist");
+
+        assert!(overlay.slab_active);
+        assert_eq!(overlay.commands.matches('M').count(), 3);
+        assert!(
+            point_to_segment_distance_sq(
+                overlay.handle3_x,
+                overlay.handle3_y,
+                overlay.start_x,
+                overlay.start_y,
+                overlay.end_x,
+                overlay.end_y,
+            ) > 1.0
+        );
+        assert!(
+            point_to_segment_distance_sq(
+                overlay.handle4_x,
+                overlay.handle4_y,
+                overlay.start_x,
+                overlay.start_y,
+                overlay.end_x,
+                overlay.end_y,
+            ) > 1.0
         );
     }
 

@@ -58,8 +58,11 @@ export struct QuadReferenceLine {
     commands: string,
     h1-x: float, h1-y: float,
     h2-x: float, h2-y: float,
+    h3-x: float, h3-y: float,
+    h4-x: float, h4-y: float,
     kind: int,
     active: bool,
+    slab-active: bool,
 }
 
 component QuadViewportTile inherits Rectangle {
@@ -148,6 +151,32 @@ component QuadViewportTile inherits Rectangle {
         height: line.active ? 8px : 6px;
         border-radius: line.active ? 4px : 3px;
         background: line.active ? Theme.accent-hover : (line.kind == 0 ? #4FC3F7 : (line.kind == 1 ? #8BC34A : #FFB74D));
+    }
+
+    for line[idx] in reference-lines: Rectangle {
+        x: line.h3-x * 1px - (line.active ? 4px : 3px);
+        y: line.h3-y * 1px - (line.active ? 4px : 3px);
+        width: line.active ? 8px : 6px;
+        height: line.active ? 8px : 6px;
+        border-radius: line.active ? 4px : 3px;
+        border-width: line.slab-active ? 0px : 1px;
+        border-color: line.active ? Theme.accent-hover : (line.kind == 0 ? #4FC3F7 : (line.kind == 1 ? #8BC34A : #FFB74D));
+        background: line.slab-active
+            ? (line.active ? Theme.accent-hover : (line.kind == 0 ? #4FC3F7 : (line.kind == 1 ? #8BC34A : #FFB74D)))
+            : #000000CC;
+    }
+
+    for line[idx] in reference-lines: Rectangle {
+        x: line.h4-x * 1px - (line.active ? 4px : 3px);
+        y: line.h4-y * 1px - (line.active ? 4px : 3px);
+        width: line.active ? 8px : 6px;
+        height: line.active ? 8px : 6px;
+        border-radius: line.active ? 4px : 3px;
+        border-width: line.slab-active ? 0px : 1px;
+        border-color: line.active ? Theme.accent-hover : (line.kind == 0 ? #4FC3F7 : (line.kind == 1 ? #8BC34A : #FFB74D));
+        background: line.slab-active
+            ? (line.active ? Theme.accent-hover : (line.kind == 0 ? #4FC3F7 : (line.kind == 1 ? #8BC34A : #FFB74D)))
+            : #000000CC;
     }
 
     Rectangle {
