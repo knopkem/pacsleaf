@@ -561,6 +561,11 @@ fn open_remote_viewer_for_study(
     viewer.set_study_description(study_description.into());
     viewer.set_measurement_panel_visible(false);
     viewer.set_volume_preview_active(false);
+    viewer.set_lut_label("Gray".into());
+    viewer.set_orientation_top("".into());
+    viewer.set_orientation_bottom("".into());
+    viewer.set_orientation_left("".into());
+    viewer.set_orientation_right("".into());
     viewer.set_measurements(ModelRc::from(Rc::new(VecModel::from(Vec::<
         leaf_ui::MeasurementEntry,
     >::new()))));
@@ -607,6 +612,27 @@ fn open_remote_viewer_for_study(
     viewer.on_toggle_volume_preview(move || {
         if let Some(viewer) = viewer_weak_for_volume.upgrade() {
             viewer.set_connection_status("3D preview is only available for local studies".into());
+        }
+    });
+    for callback in [
+        leaf_ui::StudyViewerWindow::on_rotate_image,
+        leaf_ui::StudyViewerWindow::on_flip_horizontal,
+        leaf_ui::StudyViewerWindow::on_flip_vertical,
+        leaf_ui::StudyViewerWindow::on_invert_image,
+    ] {
+        let viewer_weak_for_transform = viewer.as_weak();
+        callback(&viewer, move || {
+            if let Some(viewer) = viewer_weak_for_transform.upgrade() {
+                viewer.set_connection_status(
+                    "2D image transforms are only available for local studies".into(),
+                );
+            }
+        });
+    }
+    let viewer_weak_for_lut = viewer.as_weak();
+    viewer.on_cycle_lut(move || {
+        if let Some(viewer) = viewer_weak_for_lut.upgrade() {
+            viewer.set_connection_status("Color LUTs are only available for local studies".into());
         }
     });
     viewer.window().on_close_requested(move || {
@@ -706,6 +732,15 @@ fn update_remote_viewer_image(
             .map_err(|error| LeafError::Render(error.to_string()))?,
     );
     viewer.set_volume_preview_active(false);
+    viewer.set_image_rotated(false);
+    viewer.set_image_flipped_h(false);
+    viewer.set_image_flipped_v(false);
+    viewer.set_image_inverted(false);
+    viewer.set_lut_label("Gray".into());
+    viewer.set_orientation_top("".into());
+    viewer.set_orientation_bottom("".into());
+    viewer.set_orientation_left("".into());
+    viewer.set_orientation_right("".into());
     viewer.set_window_info("Remote render".into());
     viewer.set_slice_info("1/1".into());
     viewer.set_zoom_info("Fit".into());

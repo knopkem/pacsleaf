@@ -73,9 +73,18 @@ export component StudyViewerWindow inherits Window {
     in property <string> window-info: "W:400 L:40";
     in property <string> slice-info: "1/1";
     in property <string> zoom-info: "100%";
+    in property <string> lut-label: "Gray";
+    in property <string> orientation-top: "";
+    in property <string> orientation-bottom: "";
+    in property <string> orientation-left: "";
+    in property <string> orientation-right: "";
     in property <image> viewport-image;
     in property <bool> measurement-panel-visible: false;
     in property <bool> volume-preview-active: false;
+    in property <bool> image-rotated: false;
+    in property <bool> image-flipped-h: false;
+    in property <bool> image-flipped-v: false;
+    in property <bool> image-inverted: false;
     in-out property <float> viewport-scale: 1.0;
     in-out property <float> viewport-offset-x: 0.0;
     in-out property <float> viewport-offset-y: 0.0;
@@ -87,6 +96,11 @@ export component StudyViewerWindow inherits Window {
     callback viewport-mouse-up(float, float, float, float);
     callback viewport-scroll(float);
     callback viewport-resized(float, float);
+    callback rotate-image();
+    callback flip-horizontal();
+    callback flip-vertical();
+    callback invert-image();
+    callback cycle-lut();
     callback measurement-clicked(string);
     callback measurement-deleted(string);
     callback reset-view();
@@ -140,6 +154,34 @@ export component StudyViewerWindow inherits Window {
                     label: "Zoom";
                     active: active-tool == ViewerTool.zoom;
                     clicked => { root.tool-selected(ViewerTool.zoom); }
+                }
+
+                Rectangle { width: 1px; height: 28px; background: Theme.border; }
+
+                ToolbarButton {
+                    label: "Rot";
+                    active: image-rotated;
+                    clicked => { root.rotate-image(); }
+                }
+                ToolbarButton {
+                    label: "H";
+                    active: image-flipped-h;
+                    clicked => { root.flip-horizontal(); }
+                }
+                ToolbarButton {
+                    label: "V";
+                    active: image-flipped-v;
+                    clicked => { root.flip-vertical(); }
+                }
+                ToolbarButton {
+                    label: "Inv";
+                    active: image-inverted;
+                    clicked => { root.invert-image(); }
+                }
+                ToolbarButton {
+                    label: lut-label;
+                    active: lut-label != "Gray";
+                    clicked => { root.cycle-lut(); }
                 }
 
                 Rectangle { width: 1px; height: 28px; background: Theme.border; }
@@ -373,6 +415,15 @@ export component StudyViewerWindow inherits Window {
                         font-size: Theme.font-sm;
                     }
                     Text {
+                        x: (parent.width - self.width) / 2;
+                        y: 8px;
+                        text: root.orientation-top;
+                        color: #F0F0F5CC;
+                        font-size: Theme.font-sm;
+                        font-weight: 600;
+                    }
+
+                    Text {
                         x: 12px;
                         y: 24px;
                         text: root.study-description;
@@ -382,10 +433,37 @@ export component StudyViewerWindow inherits Window {
 
                     Text {
                         x: 12px;
+                        y: (parent.height - self.height) / 2;
+                        text: root.orientation-left;
+                        color: #F0F0F5CC;
+                        font-size: Theme.font-sm;
+                        font-weight: 600;
+                    }
+
+                    Text {
+                        x: parent.width - self.width - 12px;
+                        y: (parent.height - self.height) / 2;
+                        text: root.orientation-right;
+                        color: #F0F0F5CC;
+                        font-size: Theme.font-sm;
+                        font-weight: 600;
+                    }
+
+                    Text {
+                        x: 12px;
                         y: parent.height - 36px;
                         text: root.window-info;
                         color: #F0F0F5CC;
                         font-size: Theme.font-xs;
+                    }
+
+                    Text {
+                        x: (parent.width - self.width) / 2;
+                        y: parent.height - 36px;
+                        text: root.orientation-bottom;
+                        color: #F0F0F5CC;
+                        font-size: Theme.font-sm;
+                        font-weight: 600;
                     }
 
                     Text {

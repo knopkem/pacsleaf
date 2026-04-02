@@ -9,18 +9,32 @@ use leaf_core::domain::{InstanceInfo, SeriesInfo, SeriesUid, StudyUid};
 use leaf_core::error::{LeafError, LeafResult};
 use leaf_db::imagebox::Imagebox;
 use leaf_dicom::metadata::read_instance_geometry;
+use leaf_dicom::overlay::{load_overlays, OverlayBitmap};
 use leaf_dicom::pixel::{decode_frame_with_window, frame_count};
-use leaf_render::{PreparedVolume, VolumePreviewImage, VolumePreviewRenderer, VolumeViewState};
+use leaf_render::{
+    lut::ColorLut, PreparedVolume, VolumePreviewImage, VolumePreviewRenderer, VolumeViewState,
+};
 use leaf_tools::measurement::{Measurement, MeasurementKind, MeasurementValue};
+use lru::LruCache;
 use slint::{ComponentHandle, ModelRc, VecModel};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::rc::Rc;
 use tracing::info;
 
 const THUMB_SIZE: usize = 64;
+const FRAME_CACHE_CAPACITY: usize = 32;
+const DEFAULT_LUT_NAME: &str = "grayscale";
+const LUT_PRESETS: [(&str, &str); 4] = [
+    ("Gray", "grayscale"),
+    ("Hot", "hot_iron"),
+    ("Bone", "bone"),
+    ("InvG", "grayscale_inverted"),
+];
+const OVERLAY_COLOR: [u8; 4] = [255, 196, 0, 255];
 
 struct ViewerSession {
     viewer: slint::Weak<leaf_ui::StudyViewerWindow>,
@@ -30,6 +44,7 @@ struct ViewerSession {
     frames_by_series: HashMap<String, Vec<FrameRef>>,
     measurements_by_series: HashMap<String, Vec<Measurement>>,
     thumbnails_by_series: HashMap<String, slint::Image>,
+    overlay_cache_by_file: HashMap<String, Vec<OverlayBitmap>>,
     active_series_uid: String,
     active_frame_index: usize,
     measurement_panel_visible: bool,
@@ -46,6 +61,11 @@ struct ViewerSession {
     viewport_height: f32,
     active_frame_width: u32,
     active_frame_height: u32,
+    display_frame_width: u32,
+    display_frame_height: u32,
+    image_transform: ImageTransformState,
+    active_lut_name: String,
+    frame_cache: LruCache<FrameCacheKey, CachedFrame>,
     selected_measurement_id: Option<String>,
     draft_measurement: Option<DraftMeasurement>,
     handle_drag: Option<HandleDrag>,
@@ -60,6 +80,7 @@ struct ViewerSession {
 struct FrameRef {
     file_path: String,
     frame_index: u32,
+    image_orientation_patient: Option<[f64; 6]>,
 }
 
 #[derive(Clone, Copy)]
@@ -79,6 +100,45 @@ struct VolumeDragState {
     origin_y: f32,
     button: i32, // 0 = left, 2 = right
     start_view_state: VolumeViewState,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ImageTransformState {
+    rotation_quarters: u8,
+    flip_horizontal: bool,
+    flip_vertical: bool,
+    invert: bool,
+}
+
+impl ImageTransformState {
+    fn is_rotated(self) -> bool {
+        self.rotation_quarters % 4 != 0
+    }
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct FrameCacheKey {
+    file_path: String,
+    frame_index: u32,
+    has_window_override: bool,
+    window_center_bits: u64,
+    window_width_bits: u64,
+    lut_name: String,
+    rotation_quarters: u8,
+    flip_horizontal: bool,
+    flip_vertical: bool,
+    invert: bool,
+}
+
+#[derive(Clone)]
+struct CachedFrame {
+    source_width: u32,
+    source_height: u32,
+    display_width: u32,
+    display_height: u32,
+    rgba: Vec<u8>,
+    window_center: f64,
+    window_width: f64,
 }
 
 #[derive(Clone)]
@@ -210,6 +270,7 @@ pub(crate) fn open_viewer_for_study(
         frames_by_series,
         measurements_by_series,
         thumbnails_by_series,
+        overlay_cache_by_file: HashMap::new(),
         active_series_uid,
         active_frame_index: 0,
         measurement_panel_visible: false,
@@ -226,6 +287,13 @@ pub(crate) fn open_viewer_for_study(
         viewport_height: 0.0,
         active_frame_width: 0,
         active_frame_height: 0,
+        display_frame_width: 0,
+        display_frame_height: 0,
+        image_transform: ImageTransformState::default(),
+        active_lut_name: DEFAULT_LUT_NAME.to_string(),
+        frame_cache: LruCache::new(
+            NonZeroUsize::new(FRAME_CACHE_CAPACITY).expect("frame cache capacity must be > 0"),
+        ),
         selected_measurement_id: None,
         draft_measurement: None,
         handle_drag: None,
@@ -292,6 +360,67 @@ pub(crate) fn open_viewer_for_study(
             }
         } else if let Some(viewer) = session.viewer.upgrade() {
             viewer.set_active_tool(session.active_tool);
+        }
+    });
+
+    let session_for_rotate = session.clone();
+    viewer.on_rotate_image(move || {
+        let mut session = session_for_rotate.borrow_mut();
+        if session.volume_preview_active {
+            return;
+        }
+        session.image_transform.rotation_quarters =
+            (session.image_transform.rotation_quarters + 1) % 4;
+        if let Err(error) = update_viewer_image(&mut session) {
+            info!("Failed to rotate image: {}", error);
+        }
+    });
+
+    let session_for_flip_h = session.clone();
+    viewer.on_flip_horizontal(move || {
+        let mut session = session_for_flip_h.borrow_mut();
+        if session.volume_preview_active {
+            return;
+        }
+        session.image_transform.flip_horizontal = !session.image_transform.flip_horizontal;
+        if let Err(error) = update_viewer_image(&mut session) {
+            info!("Failed to flip image horizontally: {}", error);
+        }
+    });
+
+    let session_for_flip_v = session.clone();
+    viewer.on_flip_vertical(move || {
+        let mut session = session_for_flip_v.borrow_mut();
+        if session.volume_preview_active {
+            return;
+        }
+        session.image_transform.flip_vertical = !session.image_transform.flip_vertical;
+        if let Err(error) = update_viewer_image(&mut session) {
+            info!("Failed to flip image vertically: {}", error);
+        }
+    });
+
+    let session_for_invert = session.clone();
+    viewer.on_invert_image(move || {
+        let mut session = session_for_invert.borrow_mut();
+        if session.volume_preview_active {
+            return;
+        }
+        session.image_transform.invert = !session.image_transform.invert;
+        if let Err(error) = update_viewer_image(&mut session) {
+            info!("Failed to invert image: {}", error);
+        }
+    });
+
+    let session_for_lut = session.clone();
+    viewer.on_cycle_lut(move || {
+        let mut session = session_for_lut.borrow_mut();
+        if session.volume_preview_active {
+            return;
+        }
+        session.active_lut_name = next_lut_name(&session.active_lut_name).to_string();
+        if let Err(error) = update_viewer_image(&mut session) {
+            info!("Failed to change LUT: {}", error);
         }
     });
 
@@ -1270,25 +1399,308 @@ fn persist_measurements(session: &ViewerSession) {
     }
 }
 
+fn lut_label(name: &str) -> &'static str {
+    LUT_PRESETS
+        .iter()
+        .find_map(|(label, lut_name)| (*lut_name == name).then_some(*label))
+        .unwrap_or("Gray")
+}
+
+fn next_lut_name(current: &str) -> &'static str {
+    LUT_PRESETS
+        .iter()
+        .position(|(_, lut_name)| *lut_name == current)
+        .map(|index| LUT_PRESETS[(index + 1) % LUT_PRESETS.len()].1)
+        .unwrap_or(DEFAULT_LUT_NAME)
+}
+
+fn resolve_color_lut(name: &str) -> ColorLut {
+    match name {
+        "grayscale_inverted" => ColorLut::grayscale_inverted(),
+        "hot_iron" => ColorLut::hot_iron(),
+        "bone" => ColorLut::bone(),
+        _ => ColorLut::grayscale(),
+    }
+}
+
+fn apply_overlays_to_rgba(
+    rgba: &mut [u8],
+    image_width: u32,
+    image_height: u32,
+    overlays: &[OverlayBitmap],
+) {
+    let image_width = image_width as usize;
+    let image_height = image_height as usize;
+    for overlay in overlays {
+        let origin_x = overlay.origin.1 as isize - 1;
+        let origin_y = overlay.origin.0 as isize - 1;
+        let columns = overlay.columns as usize;
+        let rows = overlay.rows as usize;
+        for row in 0..rows {
+            for col in 0..columns {
+                let bitmap_index = row * columns + col;
+                if overlay
+                    .bitmap
+                    .get(bitmap_index)
+                    .copied()
+                    .unwrap_or_default()
+                    == 0
+                {
+                    continue;
+                }
+                let target_x = origin_x + col as isize;
+                let target_y = origin_y + row as isize;
+                if target_x < 0
+                    || target_y < 0
+                    || target_x >= image_width as isize
+                    || target_y >= image_height as isize
+                {
+                    continue;
+                }
+                let pixel_index =
+                    (target_y as usize * image_width + target_x as usize) * OVERLAY_COLOR.len();
+                rgba[pixel_index..pixel_index + OVERLAY_COLOR.len()]
+                    .copy_from_slice(&OVERLAY_COLOR);
+            }
+        }
+    }
+}
+
+fn frame_cache_key(session: &ViewerSession, frame_ref: &FrameRef) -> FrameCacheKey {
+    let (has_window_override, window_center_bits, window_width_bits) =
+        match session.window_center.zip(session.window_width) {
+            Some((center, width)) => (true, center.to_bits(), width.to_bits()),
+            None => (false, 0, 0),
+        };
+    FrameCacheKey {
+        file_path: frame_ref.file_path.clone(),
+        frame_index: frame_ref.frame_index,
+        has_window_override,
+        window_center_bits,
+        window_width_bits,
+        lut_name: session.active_lut_name.clone(),
+        rotation_quarters: session.image_transform.rotation_quarters % 4,
+        flip_horizontal: session.image_transform.flip_horizontal,
+        flip_vertical: session.image_transform.flip_vertical,
+        invert: session.image_transform.invert,
+    }
+}
+
+fn transformed_image_dimensions(
+    width: u32,
+    height: u32,
+    transform: ImageTransformState,
+) -> (u32, u32) {
+    if transform.rotation_quarters % 2 == 0 {
+        (width, height)
+    } else {
+        (height, width)
+    }
+}
+
+fn source_to_display_point_raw(
+    point: DVec2,
+    source_width: f64,
+    source_height: f64,
+    transform: ImageTransformState,
+) -> DVec2 {
+    let rotation = transform.rotation_quarters % 4;
+    let (mut x, mut y, display_width, display_height) = match rotation {
+        0 => (point.x, point.y, source_width, source_height),
+        1 => (
+            source_height - point.y,
+            point.x,
+            source_height,
+            source_width,
+        ),
+        2 => (
+            source_width - point.x,
+            source_height - point.y,
+            source_width,
+            source_height,
+        ),
+        3 => (point.y, source_width - point.x, source_height, source_width),
+        _ => unreachable!(),
+    };
+
+    if transform.flip_horizontal {
+        x = display_width - x;
+    }
+    if transform.flip_vertical {
+        y = display_height - y;
+    }
+
+    DVec2::new(x, y)
+}
+
+fn display_to_source_point_raw(
+    point: DVec2,
+    source_width: f64,
+    source_height: f64,
+    transform: ImageTransformState,
+) -> DVec2 {
+    let (display_width, display_height) =
+        transformed_image_dimensions(source_width as u32, source_height as u32, transform);
+    let mut x = point.x;
+    let mut y = point.y;
+
+    if transform.flip_horizontal {
+        x = display_width as f64 - x;
+    }
+    if transform.flip_vertical {
+        y = display_height as f64 - y;
+    }
+
+    match transform.rotation_quarters % 4 {
+        0 => DVec2::new(x, y),
+        1 => DVec2::new(y, source_height - x),
+        2 => DVec2::new(source_width - x, source_height - y),
+        3 => DVec2::new(source_width - y, x),
+        _ => unreachable!(),
+    }
+}
+
+fn transform_rgba(
+    rgba: &[u8],
+    source_width: u32,
+    source_height: u32,
+    transform: ImageTransformState,
+) -> Vec<u8> {
+    let (display_width, display_height) =
+        transformed_image_dimensions(source_width, source_height, transform);
+    let mut output = vec![0u8; display_width as usize * display_height as usize * 4];
+    let display_width_usize = display_width as usize;
+    let display_height_usize = display_height as usize;
+    let source_width_usize = source_width as usize;
+    let source_height_usize = source_height as usize;
+
+    for dy in 0..display_height_usize {
+        for dx in 0..display_width_usize {
+            let mut rx = dx;
+            let mut ry = dy;
+
+            if transform.flip_horizontal {
+                rx = display_width_usize - 1 - rx;
+            }
+            if transform.flip_vertical {
+                ry = display_height_usize - 1 - ry;
+            }
+
+            let (sx, sy) = match transform.rotation_quarters % 4 {
+                0 => (rx, ry),
+                1 => (ry, source_height_usize - 1 - rx),
+                2 => (source_width_usize - 1 - rx, source_height_usize - 1 - ry),
+                3 => (source_width_usize - 1 - ry, rx),
+                _ => unreachable!(),
+            };
+
+            let source_index = (sy * source_width_usize + sx) * 4;
+            let output_index = (dy * display_width_usize + dx) * 4;
+            output[output_index..output_index + 4]
+                .copy_from_slice(&rgba[source_index..source_index + 4]);
+            if transform.invert {
+                output[output_index] = 255 - output[output_index];
+                output[output_index + 1] = 255 - output[output_index + 1];
+                output[output_index + 2] = 255 - output[output_index + 2];
+            }
+        }
+    }
+
+    output
+}
+
+fn patient_orientation_label(vector: [f64; 3]) -> String {
+    let mut axes = [
+        (vector[0].abs(), if vector[0] >= 0.0 { 'L' } else { 'R' }),
+        (vector[1].abs(), if vector[1] >= 0.0 { 'P' } else { 'A' }),
+        (vector[2].abs(), if vector[2] >= 0.0 { 'S' } else { 'I' }),
+    ];
+    axes.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+    axes.into_iter()
+        .filter(|(magnitude, _)| *magnitude > 0.2)
+        .take(3)
+        .map(|(_, label)| label)
+        .collect()
+}
+
+fn orientation_labels_for_frame(
+    orientation: Option<[f64; 6]>,
+    transform: ImageTransformState,
+) -> (String, String, String, String) {
+    let Some(iop) = orientation else {
+        return (String::new(), String::new(), String::new(), String::new());
+    };
+    let row = [iop[0], iop[1], iop[2]];
+    let col = [iop[3], iop[4], iop[5]];
+    let (mut right, mut down) = match transform.rotation_quarters % 4 {
+        0 => (row, col),
+        1 => ([-col[0], -col[1], -col[2]], [row[0], row[1], row[2]]),
+        2 => ([-row[0], -row[1], -row[2]], [-col[0], -col[1], -col[2]]),
+        3 => ([col[0], col[1], col[2]], [-row[0], -row[1], -row[2]]),
+        _ => unreachable!(),
+    };
+
+    if transform.flip_horizontal {
+        right = [-right[0], -right[1], -right[2]];
+    }
+    if transform.flip_vertical {
+        down = [-down[0], -down[1], -down[2]];
+    }
+
+    (
+        patient_orientation_label([-down[0], -down[1], -down[2]]),
+        patient_orientation_label(down),
+        patient_orientation_label([-right[0], -right[1], -right[2]]),
+        patient_orientation_label(right),
+    )
+}
+
+fn apply_orientation_labels(
+    viewer: &leaf_ui::StudyViewerWindow,
+    orientation: Option<[f64; 6]>,
+    transform: ImageTransformState,
+) {
+    let (top, bottom, left, right) = orientation_labels_for_frame(orientation, transform);
+    viewer.set_orientation_top(top.into());
+    viewer.set_orientation_bottom(bottom.into());
+    viewer.set_orientation_left(left.into());
+    viewer.set_orientation_right(right.into());
+}
+
+fn clear_orientation_labels(viewer: &leaf_ui::StudyViewerWindow) {
+    viewer.set_orientation_top("".into());
+    viewer.set_orientation_bottom("".into());
+    viewer.set_orientation_left("".into());
+    viewer.set_orientation_right("".into());
+}
+
 fn image_to_viewport_point(session: &ViewerSession, point: DVec2) -> Option<(f32, f32)> {
     let geometry = current_viewport_geometry(session)?;
-    let frame_width = session.active_frame_width as f32;
-    let frame_height = session.active_frame_height as f32;
-    if frame_width <= 0.0 || frame_height <= 0.0 {
+    let source_width = session.active_frame_width as f64;
+    let source_height = session.active_frame_height as f64;
+    let display_width = session.display_frame_width as f32;
+    let display_height = session.display_frame_height as f32;
+    if source_width <= 0.0 || source_height <= 0.0 || display_width <= 0.0 || display_height <= 0.0
+    {
         return None;
     }
 
+    let display_point =
+        source_to_display_point_raw(point, source_width, source_height, session.image_transform);
     Some((
-        geometry.image_origin_x + (point.x as f32 / frame_width) * geometry.image_width,
-        geometry.image_origin_y + (point.y as f32 / frame_height) * geometry.image_height,
+        geometry.image_origin_x + (display_point.x as f32 / display_width) * geometry.image_width,
+        geometry.image_origin_y + (display_point.y as f32 / display_height) * geometry.image_height,
     ))
 }
 
 fn viewport_to_image_point(session: &ViewerSession, x: f32, y: f32, clamp: bool) -> Option<DVec2> {
     let geometry = current_viewport_geometry(session)?;
-    let frame_width = session.active_frame_width as f32;
-    let frame_height = session.active_frame_height as f32;
-    if frame_width <= 0.0 || frame_height <= 0.0 {
+    let source_width = session.active_frame_width as f64;
+    let source_height = session.active_frame_height as f64;
+    let display_width = session.display_frame_width as f32;
+    let display_height = session.display_frame_height as f32;
+    if source_width <= 0.0 || source_height <= 0.0 || display_width <= 0.0 || display_height <= 0.0
+    {
         return None;
     }
 
@@ -1302,9 +1714,20 @@ fn viewport_to_image_point(session: &ViewerSession, x: f32, y: f32, clamp: bool)
         return None;
     }
 
+    let display_point = DVec2::new(
+        normalized_x as f64 * display_width as f64,
+        normalized_y as f64 * display_height as f64,
+    );
+    let source_point = display_to_source_point_raw(
+        display_point,
+        source_width,
+        source_height,
+        session.image_transform,
+    );
+
     Some(DVec2::new(
-        normalized_x as f64 * frame_width as f64,
-        normalized_y as f64 * frame_height as f64,
+        source_point.x.clamp(0.0, source_width),
+        source_point.y.clamp(0.0, source_height),
     ))
 }
 
@@ -1312,8 +1735,8 @@ fn current_viewport_geometry(session: &ViewerSession) -> Option<ViewportGeometry
     displayed_image_geometry(
         session.viewport_width,
         session.viewport_height,
-        session.active_frame_width,
-        session.active_frame_height,
+        session.display_frame_width,
+        session.display_frame_height,
         session.viewport_scale,
         session.viewport_offset_x,
         session.viewport_offset_y,
@@ -1370,34 +1793,75 @@ fn update_viewer_image(session: &mut ViewerSession) -> LeafResult<()> {
     let total = frames.len();
     let frame_ref = frames
         .get(session.active_frame_index)
+        .cloned()
         .ok_or_else(|| LeafError::NoData("Frame index out of range".into()))?;
-    let frame = decode_frame_with_window(
-        Path::new(&frame_ref.file_path),
-        frame_ref.frame_index,
-        session.window_center.zip(session.window_width),
-    )?;
+    let cache_key = frame_cache_key(session, &frame_ref);
+    let cached = session.frame_cache.get(&cache_key).cloned();
+    let cached = if let Some(cached) = cached {
+        cached
+    } else {
+        let frame = decode_frame_with_window(
+            Path::new(&frame_ref.file_path),
+            frame_ref.frame_index,
+            session.window_center.zip(session.window_width),
+        )?;
+        if !session
+            .overlay_cache_by_file
+            .contains_key(&frame_ref.file_path)
+        {
+            let overlays = load_overlays(Path::new(&frame_ref.file_path))?;
+            session
+                .overlay_cache_by_file
+                .insert(frame_ref.file_path.clone(), overlays);
+        }
+        let mut rgba = to_rgba(&frame, &session.active_lut_name)?;
+        if let Some(overlays) = session.overlay_cache_by_file.get(&frame_ref.file_path) {
+            apply_overlays_to_rgba(&mut rgba, frame.width, frame.height, overlays);
+        }
+        let transformed = transform_rgba(&rgba, frame.width, frame.height, session.image_transform);
+        let (display_width, display_height) =
+            transformed_image_dimensions(frame.width, frame.height, session.image_transform);
+        let cached = CachedFrame {
+            source_width: frame.width,
+            source_height: frame.height,
+            display_width,
+            display_height,
+            rgba: transformed,
+            window_center: frame.window_center,
+            window_width: frame.window_width,
+        };
+        session.frame_cache.put(cache_key, cached.clone());
+        cached
+    };
 
     if session.default_window_center.is_none() || session.default_window_width.is_none() {
-        session.default_window_center = Some(frame.window_center);
-        session.default_window_width = Some(frame.window_width);
+        session.default_window_center = Some(cached.window_center);
+        session.default_window_width = Some(cached.window_width);
     }
     if session.window_center.is_none() || session.window_width.is_none() {
-        session.window_center = Some(frame.window_center);
-        session.window_width = Some(frame.window_width);
+        session.window_center = Some(cached.window_center);
+        session.window_width = Some(cached.window_width);
     }
-    session.active_frame_width = frame.width;
-    session.active_frame_height = frame.height;
-    let rgba = to_rgba(&frame)?;
+    session.active_frame_width = cached.source_width;
+    session.active_frame_height = cached.source_height;
+    session.display_frame_width = cached.display_width;
+    session.display_frame_height = cached.display_height;
 
     let viewer = session
         .viewer
         .upgrade()
         .ok_or_else(|| LeafError::Render("Viewer window no longer available".into()))?;
+    viewer.set_connection_status("Local imagebox".into());
     viewer.set_viewport_image(
-        leaf_ui::image_from_rgba8(frame.width, frame.height, rgba)
+        leaf_ui::image_from_rgba8(cached.display_width, cached.display_height, cached.rgba)
             .map_err(|error| LeafError::Render(error.to_string()))?,
     );
     viewer.set_slice_info(format!("{}/{}", session.active_frame_index + 1, total).into());
+    apply_orientation_labels(
+        &viewer,
+        frame_ref.image_orientation_patient,
+        session.image_transform,
+    );
     apply_viewport_state(session)?;
     Ok(())
 }
@@ -1418,6 +1882,7 @@ fn build_frames_by_series(
                     frames.push(FrameRef {
                         file_path: file_path.clone(),
                         frame_index: frame_index as u32,
+                        image_orientation_patient: instance.image_orientation_patient,
                     });
                 }
             }
@@ -1434,6 +1899,11 @@ fn apply_viewport_state(session: &ViewerSession) -> LeafResult<()> {
 
     viewer.set_active_tool(session.active_tool);
     viewer.set_volume_preview_active(session.volume_preview_active);
+    viewer.set_image_rotated(session.image_transform.is_rotated());
+    viewer.set_image_flipped_h(session.image_transform.flip_horizontal);
+    viewer.set_image_flipped_v(session.image_transform.flip_vertical);
+    viewer.set_image_inverted(session.image_transform.invert);
+    viewer.set_lut_label(lut_label(&session.active_lut_name).into());
 
     if session.volume_preview_active {
         if let Some(prepared) = session
@@ -1459,6 +1929,7 @@ fn apply_viewport_state(session: &ViewerSession) -> LeafResult<()> {
         viewer.set_viewport_offset_x(0.0);
         viewer.set_viewport_offset_y(0.0);
         viewer.set_zoom_info(format!("3D {:.0}%", volume_zoom * 100.0).into());
+        clear_orientation_labels(&viewer);
         update_measurement_overlays(session)?;
         return Ok(());
     }
@@ -1594,6 +2065,8 @@ fn show_volume_preview(
     session.volume_preview_active = true;
     session.active_frame_width = preview.width;
     session.active_frame_height = preview.height;
+    session.display_frame_width = preview.width;
+    session.display_frame_height = preview.height;
     let viewer = session
         .viewer
         .upgrade()
@@ -1616,6 +2089,8 @@ fn reset_viewport_state(session: &mut ViewerSession, clear_defaults: bool) {
     session.viewport_scale = 1.0;
     session.viewport_offset_x = 0.0;
     session.viewport_offset_y = 0.0;
+    session.image_transform = ImageTransformState::default();
+    session.active_lut_name = DEFAULT_LUT_NAME.to_string();
     session.drag_state = None;
     session.volume_drag_state = None;
 
@@ -1755,16 +2230,17 @@ fn slice_distance(reference_ipp: [f64; 3], image_ipp: [f64; 3], scan_axis_normal
     delta[0] * scan_axis_normal[0] + delta[1] * scan_axis_normal[1] + delta[2] * scan_axis_normal[2]
 }
 
-fn to_rgba(frame: &leaf_dicom::pixel::DecodedFrame) -> LeafResult<Vec<u8>> {
+fn to_rgba(frame: &leaf_dicom::pixel::DecodedFrame, lut_name: &str) -> LeafResult<Vec<u8>> {
     let expected = frame.width as usize * frame.height as usize;
     match frame.channels {
         1 => {
             if frame.pixels.len() != expected {
                 return Err(LeafError::Render("Unexpected grayscale frame size".into()));
             }
+            let color_lut = resolve_color_lut(lut_name);
             let mut rgba = Vec::with_capacity(expected * 4);
             for value in &frame.pixels {
-                rgba.extend_from_slice(&[*value, *value, *value, 255]);
+                rgba.extend_from_slice(&color_lut.table[*value as usize]);
             }
             Ok(rgba)
         }
@@ -1913,6 +2389,38 @@ mod tests {
     }
 
     #[test]
+    fn transform_mapping_round_trips_for_rotated_flipped_images() {
+        let transform = ImageTransformState {
+            rotation_quarters: 1,
+            flip_horizontal: true,
+            flip_vertical: false,
+            invert: false,
+        };
+        let source = DVec2::new(128.0, 64.0);
+        let display = source_to_display_point_raw(source, 512.0, 256.0, transform);
+        let reconstructed = display_to_source_point_raw(display, 512.0, 256.0, transform);
+
+        assert!((reconstructed.x - source.x).abs() < 0.001);
+        assert!((reconstructed.y - source.y).abs() < 0.001);
+    }
+
+    #[test]
+    fn transformed_dimensions_swap_for_quarter_turns() {
+        let transform = ImageTransformState {
+            rotation_quarters: 1,
+            ..ImageTransformState::default()
+        };
+        assert_eq!(
+            transformed_image_dimensions(512, 256, transform),
+            (256, 512)
+        );
+        assert_eq!(
+            transformed_image_dimensions(512, 256, ImageTransformState::default()),
+            (512, 256)
+        );
+    }
+
+    #[test]
     fn preview_dimensions_keep_output_size_stable() {
         let session = ViewerSession {
             viewer: slint::Weak::default(),
@@ -1922,6 +2430,7 @@ mod tests {
             frames_by_series: HashMap::new(),
             measurements_by_series: HashMap::new(),
             thumbnails_by_series: HashMap::new(),
+            overlay_cache_by_file: HashMap::new(),
             active_series_uid: String::new(),
             active_frame_index: 0,
             measurement_panel_visible: false,
@@ -1938,6 +2447,13 @@ mod tests {
             viewport_height: 900.0,
             active_frame_width: 0,
             active_frame_height: 0,
+            display_frame_width: 0,
+            display_frame_height: 0,
+            image_transform: ImageTransformState::default(),
+            active_lut_name: DEFAULT_LUT_NAME.to_string(),
+            frame_cache: LruCache::new(
+                NonZeroUsize::new(FRAME_CACHE_CAPACITY).expect("frame cache capacity must be > 0"),
+            ),
             selected_measurement_id: None,
             draft_measurement: None,
             handle_drag: None,
@@ -1959,5 +2475,48 @@ mod tests {
             Measurement::line("series", 0, DVec2::new(0.0, 0.0), DVec2::new(3.0, 4.0));
 
         assert_eq!(measurement_value_text(&measurement, (1.0, 1.0)), "5.00 mm");
+    }
+
+    #[test]
+    fn grayscale_lut_maps_pixels_to_false_color() {
+        let frame = leaf_dicom::pixel::DecodedFrame {
+            width: 1,
+            height: 1,
+            pixels: vec![255],
+            channels: 1,
+            window_center: 0.0,
+            window_width: 0.0,
+        };
+
+        assert_eq!(
+            to_rgba(&frame, "hot_iron").expect("hot iron LUT should apply"),
+            vec![255, 255, 255, 255]
+        );
+        assert_eq!(
+            to_rgba(&frame, "grayscale_inverted").expect("inverted grayscale LUT should apply"),
+            vec![0, 0, 0, 255]
+        );
+    }
+
+    #[test]
+    fn overlays_are_composited_in_image_space() {
+        let mut rgba = vec![0u8; 4 * 4 * 4];
+        let overlay = OverlayBitmap {
+            rows: 2,
+            columns: 2,
+            origin: (2, 2),
+            bitmap: vec![1, 0, 0, 1],
+        };
+
+        apply_overlays_to_rgba(&mut rgba, 4, 4, &[overlay]);
+
+        let row_stride = 4 * 4;
+        let top_left = row_stride + 4;
+        let bottom_right = row_stride * 2 + 8;
+        let top_right = row_stride + 8;
+
+        assert_eq!(&rgba[top_left..top_left + 4], &OVERLAY_COLOR);
+        assert_eq!(&rgba[bottom_right..bottom_right + 4], &OVERLAY_COLOR);
+        assert_eq!(&rgba[top_right..top_right + 4], &[0, 0, 0, 0]);
     }
 }
