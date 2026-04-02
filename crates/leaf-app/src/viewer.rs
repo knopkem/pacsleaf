@@ -10,13 +10,15 @@ use leaf_core::error::{LeafError, LeafResult};
 use leaf_db::imagebox::Imagebox;
 use leaf_dicom::metadata::read_instance_geometry;
 use leaf_dicom::overlay::{load_overlays, OverlayBitmap};
-use leaf_dicom::pixel::{decode_frame_with_window, frame_count};
+use leaf_dicom::pixel::{
+    decode_frame_for_measurements, decode_frame_with_window, frame_count, MeasurementFrame,
+};
 use leaf_render::{
     lut::ColorLut, PreparedVolume, SlicePlane, SlicePreviewMode, SlicePreviewState,
     SliceProjectionMode, VolumeBlendMode, VolumePreviewImage, VolumePreviewRenderer,
     VolumeViewState,
 };
-use leaf_tools::measurement::{Measurement, MeasurementKind, MeasurementValue};
+use leaf_tools::measurement::{Measurement, MeasurementImage, MeasurementKind, MeasurementValue};
 use lru::LruCache;
 use slint::{ComponentHandle, ModelRc, VecModel};
 use std::cell::RefCell;
@@ -1615,7 +1617,13 @@ pub(crate) fn open_viewer_for_study(
             .map(|frames| frames.len().saturating_sub(1))
             .unwrap_or(0);
         session.active_frame_index = selected.slice_index.min(max_index);
-        let value_text = measurement_value_text(&selected, active_pixel_spacing(&session));
+        let measurement_frame = active_measurement_frame(&session);
+        let measurement_image = measurement_frame.as_ref().map(measurement_image_view);
+        let value_text = measurement_overlay_text(
+            &selected,
+            active_pixel_spacing(&session),
+            measurement_image.as_ref(),
+        );
 
         let result = update_viewer_image(&mut session)
             .and_then(|_| update_measurements_model(&session))
@@ -1876,13 +1884,28 @@ fn update_measurements_model(session: &ViewerSession) -> LeafResult<()> {
         return Ok(());
     }
     let pixel_spacing = active_pixel_spacing(session);
+    let mut measurement_frames_by_slice = HashMap::new();
     let entries = session
         .measurements_by_series
         .get(&session.active_series_uid)
         .map(|measurements| {
             measurements
                 .iter()
-                .map(|measurement| measurement_entry(measurement, pixel_spacing))
+                .map(|measurement| {
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        measurement_frames_by_slice.entry(measurement.slice_index)
+                    {
+                        if let Some(frame) =
+                            measurement_frame_for_slice(session, measurement.slice_index)
+                        {
+                            entry.insert(frame);
+                        }
+                    }
+                    let measurement_image = measurement_frames_by_slice
+                        .get(&measurement.slice_index)
+                        .map(measurement_image_view);
+                    measurement_entry(measurement, pixel_spacing, measurement_image.as_ref())
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -2597,11 +2620,12 @@ fn update_viewport_dimensions(
 fn measurement_entry(
     measurement: &Measurement,
     pixel_spacing: (f64, f64),
+    measurement_image: Option<&MeasurementImage<'_>>,
 ) -> leaf_ui::MeasurementEntry {
     leaf_ui::MeasurementEntry {
         id: measurement.id.clone().into(),
         kind: measurement_kind_label(measurement).into(),
-        value: measurement_value_text(measurement, pixel_spacing).into(),
+        value: measurement_panel_value_text(measurement, pixel_spacing, measurement_image).into(),
         label: measurement.label.clone().unwrap_or_default().into(),
         slice_index: (measurement.slice_index + 1) as i32,
     }
@@ -2618,12 +2642,55 @@ fn measurement_kind_label(measurement: &Measurement) -> &'static str {
     }
 }
 
-fn measurement_value_text(measurement: &Measurement, pixel_spacing: (f64, f64)) -> String {
-    match measurement.compute(pixel_spacing).value {
+fn measurement_value(
+    measurement: &Measurement,
+    pixel_spacing: (f64, f64),
+    measurement_image: Option<&MeasurementImage<'_>>,
+) -> MeasurementValue {
+    measurement
+        .compute_with_image(pixel_spacing, measurement_image)
+        .value
+}
+
+fn measurement_overlay_text(
+    measurement: &Measurement,
+    pixel_spacing: (f64, f64),
+    measurement_image: Option<&MeasurementImage<'_>>,
+) -> String {
+    match measurement_value(measurement, pixel_spacing, measurement_image) {
         MeasurementValue::Distance { mm } => format_distance_mm(mm),
         MeasurementValue::Angle { degrees } => format!("{degrees:.1}\u{b0}"),
+        MeasurementValue::RoiStats {
+            mean,
+            area_mm2,
+            pixel_count,
+            ..
+        } if pixel_count > 0 => format!("\u{3bc} {mean:.1} · {area_mm2:.1} mm\u{b2}"),
         MeasurementValue::RoiStats { area_mm2, .. } => format!("{area_mm2:.1} mm\u{b2}"),
-        MeasurementValue::PixelValue { value, unit } => format!("{value:.0} {unit}"),
+        MeasurementValue::PixelValue { value, unit } => format_scalar_with_unit(value, &unit),
+    }
+}
+
+fn measurement_panel_value_text(
+    measurement: &Measurement,
+    pixel_spacing: (f64, f64),
+    measurement_image: Option<&MeasurementImage<'_>>,
+) -> String {
+    match measurement_value(measurement, pixel_spacing, measurement_image) {
+        MeasurementValue::Distance { mm } => format_distance_mm(mm),
+        MeasurementValue::Angle { degrees } => format!("{degrees:.1}\u{b0}"),
+        MeasurementValue::RoiStats {
+            mean,
+            std_dev,
+            min,
+            max,
+            area_mm2,
+            pixel_count,
+        } if pixel_count > 0 => format!(
+            "\u{3bc} {mean:.1} \u{3c3} {std_dev:.1} [{min:.0}..{max:.0}] n={pixel_count} · {area_mm2:.1} mm\u{b2}"
+        ),
+        MeasurementValue::RoiStats { area_mm2, .. } => format!("{area_mm2:.1} mm\u{b2}"),
+        MeasurementValue::PixelValue { value, unit } => format_scalar_with_unit(value, &unit),
     }
 }
 
@@ -2637,6 +2704,14 @@ fn format_distance_mm(mm: f64) -> String {
     }
 }
 
+fn format_scalar_with_unit(value: f64, unit: &str) -> String {
+    if unit.is_empty() {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.0} {unit}")
+    }
+}
+
 fn active_pixel_spacing(session: &ViewerSession) -> (f64, f64) {
     session
         .series
@@ -2644,6 +2719,40 @@ fn active_pixel_spacing(session: &ViewerSession) -> (f64, f64) {
         .find(|series| series.series_uid.0 == session.active_series_uid)
         .and_then(|series| series.pixel_spacing)
         .unwrap_or((1.0, 1.0))
+}
+
+fn measurement_frame_for_slice(
+    session: &ViewerSession,
+    slice_index: usize,
+) -> Option<MeasurementFrame> {
+    let frame_ref = session
+        .frames_by_series
+        .get(&session.active_series_uid)?
+        .get(slice_index)?;
+    match decode_frame_for_measurements(Path::new(&frame_ref.file_path), frame_ref.frame_index) {
+        Ok(frame) => Some(frame),
+        Err(error) => {
+            info!(
+                "Failed to decode source pixels for measurement statistics on slice {}: {}",
+                slice_index + 1,
+                error
+            );
+            None
+        }
+    }
+}
+
+fn active_measurement_frame(session: &ViewerSession) -> Option<MeasurementFrame> {
+    measurement_frame_for_slice(session, session.active_frame_index)
+}
+
+fn measurement_image_view<'a>(frame: &'a MeasurementFrame) -> MeasurementImage<'a> {
+    MeasurementImage {
+        width: frame.width,
+        height: frame.height,
+        pixels: &frame.pixels,
+        unit: &frame.unit,
+    }
 }
 
 fn update_measurement_overlays(session: &ViewerSession) -> LeafResult<()> {
@@ -2670,6 +2779,8 @@ fn update_measurement_overlays(session: &ViewerSession) -> LeafResult<()> {
     }
 
     let pixel_spacing = active_pixel_spacing(session);
+    let measurement_frame = active_measurement_frame(session);
+    let measurement_image = measurement_frame.as_ref().map(measurement_image_view);
 
     let mut overlays = session
         .measurements_by_series
@@ -2682,6 +2793,7 @@ fn update_measurement_overlays(session: &ViewerSession) -> LeafResult<()> {
                 session,
                 measurement,
                 pixel_spacing,
+                measurement_image.as_ref(),
                 session.selected_measurement_id.as_deref() == Some(measurement.id.as_str()),
                 false,
             )
@@ -2703,7 +2815,14 @@ fn update_measurement_overlays(session: &ViewerSession) -> LeafResult<()> {
                 Measurement::ellipse_roi("", 0, *center, rx, ry)
             }
         };
-        if let Some(overlay) = measurement_to_overlay(session, &temp, pixel_spacing, false, true) {
+        if let Some(overlay) = measurement_to_overlay(
+            session,
+            &temp,
+            pixel_spacing,
+            measurement_image.as_ref(),
+            false,
+            true,
+        ) {
             overlays.push(overlay);
         }
     }
@@ -2716,10 +2835,11 @@ fn measurement_to_overlay(
     session: &ViewerSession,
     measurement: &Measurement,
     pixel_spacing: (f64, f64),
+    measurement_image: Option<&MeasurementImage<'_>>,
     selected: bool,
     draft: bool,
 ) -> Option<leaf_ui::MeasurementOverlay> {
-    let label = measurement_value_text(measurement, pixel_spacing);
+    let label = measurement_overlay_text(measurement, pixel_spacing, measurement_image);
     match &measurement.kind {
         MeasurementKind::Line { start, end } => {
             let (sx, sy) = image_to_viewport_point(session, *start)?;
@@ -2932,7 +3052,13 @@ fn finalize_measurement(session: &mut ViewerSession) -> LeafResult<()> {
     };
 
     let kind_label = measurement_kind_label(&measurement);
-    let value_text = measurement_value_text(&measurement, active_pixel_spacing(session));
+    let measurement_frame = active_measurement_frame(session);
+    let measurement_image = measurement_frame.as_ref().map(measurement_image_view);
+    let value_text = measurement_overlay_text(
+        &measurement,
+        active_pixel_spacing(session),
+        measurement_image.as_ref(),
+    );
     let active_series_uid = session.active_series_uid.clone();
     session.selected_measurement_id = Some(measurement.id.clone());
     session
@@ -4759,7 +4885,33 @@ mod tests {
         let measurement =
             Measurement::line("series", 0, DVec2::new(0.0, 0.0), DVec2::new(3.0, 4.0));
 
-        assert_eq!(measurement_value_text(&measurement, (1.0, 1.0)), "5.00 mm");
+        assert_eq!(
+            measurement_overlay_text(&measurement, (1.0, 1.0), None),
+            "5.00 mm"
+        );
+    }
+
+    #[test]
+    fn roi_panel_values_include_statistics_when_pixels_are_available() {
+        let measurement =
+            Measurement::rectangle_roi("series", 0, DVec2::new(1.0, 1.0), DVec2::new(3.0, 3.0));
+        let pixels = vec![
+            0.0, 1.0, 2.0, 3.0, //
+            4.0, 5.0, 6.0, 7.0, //
+            8.0, 9.0, 10.0, 11.0, //
+            12.0, 13.0, 14.0, 15.0,
+        ];
+        let image = MeasurementImage {
+            width: 4,
+            height: 4,
+            pixels: &pixels,
+            unit: "HU",
+        };
+
+        assert_eq!(
+            measurement_panel_value_text(&measurement, (1.0, 1.0), Some(&image)),
+            "\u{3bc} 7.5 \u{3c3} 2.1 [5..10] n=4 · 4.0 mm\u{b2}"
+        );
     }
 
     #[test]

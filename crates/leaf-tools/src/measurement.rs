@@ -4,6 +4,15 @@ use glam::DVec2;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Source image data used for pixel-based measurement statistics.
+#[derive(Debug, Clone, Copy)]
+pub struct MeasurementImage<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: &'a [f64],
+    pub unit: &'a str,
+}
+
 /// A measurement placed on a DICOM image.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Measurement {
@@ -248,6 +257,15 @@ impl Measurement {
 
     /// Compute the result of this measurement given pixel spacing.
     pub fn compute(&self, pixel_spacing: (f64, f64)) -> MeasurementResult {
+        self.compute_with_image(pixel_spacing, None)
+    }
+
+    /// Compute the result of this measurement with optional source pixel data.
+    pub fn compute_with_image(
+        &self,
+        pixel_spacing: (f64, f64),
+        image: Option<&MeasurementImage<'_>>,
+    ) -> MeasurementResult {
         let value = match &self.kind {
             MeasurementKind::Line { start, end } => {
                 let dx = (end.x - start.x) * pixel_spacing.1;
@@ -272,28 +290,35 @@ impl Measurement {
             } => {
                 let w = (bottom_right.x - top_left.x).abs() * pixel_spacing.1;
                 let h = (bottom_right.y - top_left.y).abs() * pixel_spacing.0;
-                MeasurementValue::RoiStats {
-                    mean: 0.0,
-                    std_dev: 0.0,
-                    min: 0.0,
-                    max: 0.0,
-                    area_mm2: w * h,
-                    pixel_count: 0,
-                }
+                let area_mm2 = w * h;
+                image
+                    .map(|image| {
+                        roi_stats_for_image(image, area_mm2, |point| {
+                            point.x >= top_left.x.min(bottom_right.x)
+                                && point.x <= top_left.x.max(bottom_right.x)
+                                && point.y >= top_left.y.min(bottom_right.y)
+                                && point.y <= top_left.y.max(bottom_right.y)
+                        })
+                    })
+                    .unwrap_or_else(|| empty_roi_stats(area_mm2))
             }
             MeasurementKind::EllipseRoi {
-                radius_x, radius_y, ..
+                center,
+                radius_x,
+                radius_y,
             } => {
                 let rx_mm = radius_x * pixel_spacing.1;
                 let ry_mm = radius_y * pixel_spacing.0;
-                MeasurementValue::RoiStats {
-                    mean: 0.0,
-                    std_dev: 0.0,
-                    min: 0.0,
-                    max: 0.0,
-                    area_mm2: std::f64::consts::PI * rx_mm * ry_mm,
-                    pixel_count: 0,
-                }
+                let area_mm2 = std::f64::consts::PI * rx_mm * ry_mm;
+                image
+                    .map(|image| {
+                        roi_stats_for_image(image, area_mm2, |point| {
+                            let dx = (point.x - center.x) / radius_x.max(1.0e-6);
+                            let dy = (point.y - center.y) / radius_y.max(1.0e-6);
+                            dx * dx + dy * dy <= 1.0
+                        })
+                    })
+                    .unwrap_or_else(|| empty_roi_stats(area_mm2))
             }
             MeasurementKind::PolygonRoi { points } => {
                 // Shoelace formula for area.
@@ -305,24 +330,192 @@ impl Measurement {
                     area -= points[j].x * points[i].y;
                 }
                 area = area.abs() / 2.0 * pixel_spacing.0 * pixel_spacing.1;
-                MeasurementValue::RoiStats {
-                    mean: 0.0,
-                    std_dev: 0.0,
-                    min: 0.0,
-                    max: 0.0,
-                    area_mm2: area,
-                    pixel_count: 0,
-                }
+                image
+                    .filter(|_| points.len() >= 3)
+                    .map(|image| {
+                        roi_stats_for_image(image, area, |point| point_in_polygon(point, points))
+                    })
+                    .unwrap_or_else(|| empty_roi_stats(area))
             }
-            MeasurementKind::PixelProbe { .. } => MeasurementValue::PixelValue {
-                value: 0.0,
-                unit: "HU".to_string(),
-            },
+            MeasurementKind::PixelProbe { position } => image
+                .and_then(|image| sample_image_pixel(image, *position))
+                .map(|value| MeasurementValue::PixelValue {
+                    value,
+                    unit: image
+                        .map(|image| image.unit)
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+                .unwrap_or_else(|| MeasurementValue::PixelValue {
+                    value: 0.0,
+                    unit: "HU".to_string(),
+                }),
         };
 
         MeasurementResult {
             measurement_id: self.id.clone(),
             value,
         }
+    }
+}
+
+fn empty_roi_stats(area_mm2: f64) -> MeasurementValue {
+    MeasurementValue::RoiStats {
+        mean: 0.0,
+        std_dev: 0.0,
+        min: 0.0,
+        max: 0.0,
+        area_mm2,
+        pixel_count: 0,
+    }
+}
+
+fn roi_stats_for_image(
+    image: &MeasurementImage<'_>,
+    area_mm2: f64,
+    contains: impl Fn(DVec2) -> bool,
+) -> MeasurementValue {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    if width == 0 || height == 0 || image.pixels.len() < width * height {
+        return empty_roi_stats(area_mm2);
+    }
+
+    let mut pixel_count = 0u64;
+    let mut sum = 0.0;
+    let mut sum_sq = 0.0;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+
+    for y in 0..height {
+        for x in 0..width {
+            let point = DVec2::new(x as f64 + 0.5, y as f64 + 0.5);
+            if !contains(point) {
+                continue;
+            }
+            let value = image.pixels[y * width + x];
+            pixel_count += 1;
+            sum += value;
+            sum_sq += value * value;
+            min = min.min(value);
+            max = max.max(value);
+        }
+    }
+
+    if pixel_count == 0 {
+        return empty_roi_stats(area_mm2);
+    }
+
+    let mean = sum / pixel_count as f64;
+    let variance = (sum_sq / pixel_count as f64) - mean * mean;
+    MeasurementValue::RoiStats {
+        mean,
+        std_dev: variance.max(0.0).sqrt(),
+        min,
+        max,
+        area_mm2,
+        pixel_count,
+    }
+}
+
+fn point_in_polygon(point: DVec2, points: &[DVec2]) -> bool {
+    let mut inside = false;
+    let mut previous = *points.last().unwrap_or(&point);
+    for &current in points {
+        let intersects = ((current.y > point.y) != (previous.y > point.y))
+            && (point.x
+                < (previous.x - current.x) * (point.y - current.y)
+                    / (previous.y - current.y).max(f64::EPSILON)
+                    + current.x);
+        if intersects {
+            inside = !inside;
+        }
+        previous = current;
+    }
+    inside
+}
+
+fn sample_image_pixel(image: &MeasurementImage<'_>, position: DVec2) -> Option<f64> {
+    let x = position.x.floor();
+    let y = position.y.floor();
+    if x < 0.0 || y < 0.0 || x >= image.width as f64 || y >= image.height as f64 {
+        return None;
+    }
+    let index = y as usize * image.width as usize + x as usize;
+    image.pixels.get(index).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rectangle_roi_computes_pixel_statistics() {
+        let measurement =
+            Measurement::rectangle_roi("series", 0, DVec2::new(1.0, 1.0), DVec2::new(3.0, 3.0));
+        let pixels = vec![
+            0.0, 1.0, 2.0, 3.0, //
+            4.0, 5.0, 6.0, 7.0, //
+            8.0, 9.0, 10.0, 11.0, //
+            12.0, 13.0, 14.0, 15.0,
+        ];
+        let image = MeasurementImage {
+            width: 4,
+            height: 4,
+            pixels: &pixels,
+            unit: "HU",
+        };
+
+        let result = measurement.compute_with_image((1.0, 1.0), Some(&image));
+        let MeasurementValue::RoiStats {
+            mean,
+            std_dev,
+            min,
+            max,
+            area_mm2,
+            pixel_count,
+        } = result.value
+        else {
+            panic!("expected ROI stats");
+        };
+
+        assert!((mean - 7.5).abs() < 1.0e-6);
+        assert!((std_dev - 2.0615528128).abs() < 1.0e-6);
+        assert_eq!(min, 5.0);
+        assert_eq!(max, 10.0);
+        assert_eq!(area_mm2, 4.0);
+        assert_eq!(pixel_count, 4);
+    }
+
+    #[test]
+    fn ellipse_roi_counts_pixels_inside_shape() {
+        let measurement = Measurement::ellipse_roi("series", 0, DVec2::new(2.0, 2.0), 1.5, 1.5);
+        let pixels = vec![
+            0.0, 1.0, 2.0, 3.0, //
+            4.0, 5.0, 6.0, 7.0, //
+            8.0, 9.0, 10.0, 11.0, //
+            12.0, 13.0, 14.0, 15.0,
+        ];
+        let image = MeasurementImage {
+            width: 4,
+            height: 4,
+            pixels: &pixels,
+            unit: "HU",
+        };
+
+        let result = measurement.compute_with_image((1.0, 1.0), Some(&image));
+        let MeasurementValue::RoiStats {
+            pixel_count,
+            min,
+            max,
+            ..
+        } = result.value
+        else {
+            panic!("expected ROI stats");
+        };
+
+        assert_eq!(pixel_count, 4);
+        assert_eq!(min, 5.0);
+        assert_eq!(max, 10.0);
     }
 }
