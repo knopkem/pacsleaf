@@ -26,6 +26,8 @@ export struct SeriesThumbnail {
     description: string,
     instance-count: int,
     active: bool,
+    thumbnail: image,
+    has-thumbnail: bool,
 }
 
 // Measurement display in the panel
@@ -84,7 +86,9 @@ export component StudyViewerWindow inherits Window {
     callback viewport-mouse-move(float, float, float, float);
     callback viewport-mouse-up(float, float, float, float);
     callback viewport-scroll(float);
+    callback viewport-resized(float, float);
     callback measurement-clicked(string);
+    callback measurement-deleted(string);
     callback reset-view();
     callback toggle-measurements();
     callback toggle-volume-preview();
@@ -218,9 +222,18 @@ export component StudyViewerWindow inherits Window {
                                 background: series.active ? Theme.accent-primary : Theme.surface-elevated;
                                 border-width: series.active ? 2px : 1px;
                                 border-color: series.active ? Theme.accent-hover : Theme.border;
+                                clip: true;
 
                                 TouchArea {
                                     clicked => { root.series-selected(series.series-uid); }
+                                }
+
+                                if series.has-thumbnail: Image {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    source: series.thumbnail;
+                                    image-fit: cover;
+                                    opacity: series.active ? 0.6 : 0.4;
                                 }
 
                                 VerticalLayout {
@@ -229,7 +242,7 @@ export component StudyViewerWindow inherits Window {
 
                                     Text {
                                         text: series.modality;
-                                        color: Theme.accent-primary;
+                                        color: series.active ? Theme.text-primary : Theme.accent-primary;
                                         font-size: Theme.font-xxs;
                                         font-weight: 700;
                                     }
@@ -254,6 +267,9 @@ export component StudyViewerWindow inherits Window {
                     height: parent.height;
                     background: #000000;
                     clip: true;
+
+                    changed width => { root.viewport-resized(self.width / 1px, self.height / 1px); }
+                    changed height => { root.viewport-resized(self.width / 1px, self.height / 1px); }
 
                     viewport-touch := TouchArea {
                         clicked => { viewer-focus.focus(); }
@@ -292,6 +308,10 @@ export component StudyViewerWindow inherits Window {
                         y: 0px;
                         width: parent.width;
                         height: parent.height;
+                        viewbox-x: 0;
+                        viewbox-y: 0;
+                        viewbox-width: parent.width / 1px;
+                        viewbox-height: parent.height / 1px;
                         commands: overlay.commands;
                         fill: transparent;
                         stroke: overlay.selected ? Theme.accent-hover : (overlay.draft ? #D9A03CAA : Theme.accent-gold);
@@ -307,80 +327,42 @@ export component StudyViewerWindow inherits Window {
                         font-size: Theme.font-xs;
                     }
 
-                    // Handles for selected measurements
+                    // Handles for selected measurements (large)
                     for overlay[idx] in measurement-overlays: Rectangle {
-                        visible: overlay.handle-count >= 1 && overlay.selected;
+                        visible: overlay.handle-count >= 1 && (overlay.selected || overlay.draft);
                         x: overlay.h1-x * 1px - 4px;
                         y: overlay.h1-y * 1px - 4px;
                         width: 8px;
                         height: 8px;
                         border-radius: 4px;
-                        background: Theme.accent-hover;
+                        background: overlay.draft ? #D9A03CAA : Theme.accent-hover;
                     }
                     for overlay[idx] in measurement-overlays: Rectangle {
-                        visible: overlay.handle-count >= 2 && overlay.selected;
+                        visible: overlay.handle-count >= 2 && (overlay.selected || overlay.draft);
                         x: overlay.h2-x * 1px - 4px;
                         y: overlay.h2-y * 1px - 4px;
                         width: 8px;
                         height: 8px;
                         border-radius: 4px;
-                        background: Theme.accent-hover;
+                        background: overlay.draft ? #D9A03CAA : Theme.accent-hover;
                     }
                     for overlay[idx] in measurement-overlays: Rectangle {
-                        visible: overlay.handle-count >= 3 && overlay.selected;
+                        visible: overlay.handle-count >= 3 && (overlay.selected || overlay.draft);
                         x: overlay.h3-x * 1px - 4px;
                         y: overlay.h3-y * 1px - 4px;
                         width: 8px;
                         height: 8px;
                         border-radius: 4px;
-                        background: Theme.accent-hover;
+                        background: overlay.draft ? #D9A03CAA : Theme.accent-hover;
                     }
                     for overlay[idx] in measurement-overlays: Rectangle {
-                        visible: overlay.handle-count >= 4 && overlay.selected;
+                        visible: overlay.handle-count >= 4 && (overlay.selected || overlay.draft);
                         x: overlay.h4-x * 1px - 4px;
                         y: overlay.h4-y * 1px - 4px;
                         width: 8px;
                         height: 8px;
                         border-radius: 4px;
-                        background: Theme.accent-hover;
-                    }
-
-                    // Handles for draft measurements
-                    for overlay[idx] in measurement-overlays: Rectangle {
-                        visible: overlay.handle-count >= 1 && overlay.draft;
-                        x: overlay.h1-x * 1px - 3px;
-                        y: overlay.h1-y * 1px - 3px;
-                        width: 6px;
-                        height: 6px;
-                        border-radius: 3px;
-                        background: #D9A03CAA;
-                    }
-                    for overlay[idx] in measurement-overlays: Rectangle {
-                        visible: overlay.handle-count >= 2 && overlay.draft;
-                        x: overlay.h2-x * 1px - 3px;
-                        y: overlay.h2-y * 1px - 3px;
-                        width: 6px;
-                        height: 6px;
-                        border-radius: 3px;
-                        background: #D9A03CAA;
-                    }
-                    for overlay[idx] in measurement-overlays: Rectangle {
-                        visible: overlay.handle-count >= 3 && overlay.draft;
-                        x: overlay.h3-x * 1px - 3px;
-                        y: overlay.h3-y * 1px - 3px;
-                        width: 6px;
-                        height: 6px;
-                        border-radius: 3px;
-                        background: #D9A03CAA;
-                    }
-                    for overlay[idx] in measurement-overlays: Rectangle {
-                        visible: overlay.handle-count >= 4 && overlay.draft;
-                        x: overlay.h4-x * 1px - 3px;
-                        y: overlay.h4-y * 1px - 3px;
-                        width: 6px;
-                        height: 6px;
-                        border-radius: 3px;
-                        background: #D9A03CAA;
+                        background: overlay.draft ? #D9A03CAA : Theme.accent-hover;
                     }
 
                     Text {
@@ -466,27 +448,49 @@ export component StudyViewerWindow inherits Window {
                                         clicked => { root.measurement-clicked(meas.id); }
                                     }
 
-                                    VerticalLayout {
-                                        padding: Theme.spacing-sm;
+                                    HorizontalLayout {
+                                        padding-right: Theme.spacing-md;
+                                        
+                                        VerticalLayout {
+                                            padding: Theme.spacing-sm;
+                                            horizontal-stretch: 1;
 
-                                        HorizontalLayout {
-                                            Text {
-                                                text: meas.kind;
-                                                color: Theme.accent-gold;
-                                                font-size: Theme.font-xs;
-                                                font-weight: 600;
+                                            HorizontalLayout {
+                                                Text {
+                                                    text: meas.kind;
+                                                    color: Theme.accent-gold;
+                                                    font-size: Theme.font-xs;
+                                                    font-weight: 600;
+                                                }
+                                                Rectangle { }
+                                                Text {
+                                                    text: "Sl \{meas.slice-index}";
+                                                    color: Theme.text-muted;
+                                                    font-size: Theme.font-xxs;
+                                                }
                                             }
-                                            Rectangle { }
                                             Text {
-                                                text: "Sl \{meas.slice-index}";
-                                                color: Theme.text-muted;
-                                                font-size: Theme.font-xxs;
+                                                text: meas.value;
+                                                color: Theme.text-primary;
+                                                font-size: Theme.font-sm;
                                             }
                                         }
-                                        Text {
-                                            text: meas.value;
-                                            color: Theme.text-primary;
-                                            font-size: Theme.font-sm;
+
+                                        Rectangle {
+                                            width: 24px;
+                                            height: parent.height;
+
+                                            del-touch := TouchArea {
+                                                clicked => { root.measurement-deleted(meas.id); }
+                                            }
+
+                                            Text {
+                                                text: "🗑";
+                                                color: del-touch.has-hover ? Theme.danger : Theme.text-muted;
+                                                font-size: Theme.font-sm;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
                                         }
                                     }
 

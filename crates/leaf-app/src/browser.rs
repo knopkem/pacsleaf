@@ -11,6 +11,9 @@ use slint::{ModelRc, SharedString, VecModel};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+pub(crate) const BROWSER_WINDOW_GEOMETRY_KEY: &str = "browser_window_geometry";
+pub(crate) const VIEWER_WINDOW_GEOMETRY_KEY: &str = "viewer_window_geometry";
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct BrowserQuery<'a> {
     patient_name: &'a str,
@@ -69,6 +72,14 @@ pub(crate) struct BrowserSettings {
     pub(crate) dicomweb_url: String,
     #[serde(default)]
     pub(crate) auth_token: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct WindowGeometry {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 impl BrowserSettings {
@@ -381,6 +392,50 @@ pub(crate) fn apply_browser_settings(
     browser.set_remote_ae_title(settings.remote_ae_title.clone().into());
     browser.set_dicomweb_url(settings.dicomweb_url.clone().into());
     browser.set_auth_token(settings.auth_token.clone().into());
+}
+
+pub(crate) fn load_window_geometry(
+    imagebox: &Imagebox,
+    key: &str,
+) -> LeafResult<Option<WindowGeometry>> {
+    imagebox
+        .get_setting(key)?
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| LeafError::Database(error.to_string()))
+        })
+        .transpose()
+}
+
+pub(crate) fn save_window_geometry(
+    imagebox: &Imagebox,
+    key: &str,
+    geometry: &WindowGeometry,
+) -> LeafResult<()> {
+    let value =
+        serde_json::to_string(geometry).map_err(|error| LeafError::Database(error.to_string()))?;
+    imagebox.set_setting(key, &value)
+}
+
+pub(crate) fn capture_window_geometry(window: &slint::Window) -> Option<WindowGeometry> {
+    let position = window.position();
+    let size = window.size();
+    if size.width == 0 || size.height == 0 {
+        return None;
+    }
+    Some(WindowGeometry {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+    })
+}
+
+pub(crate) fn apply_window_geometry(window: &slint::Window, geometry: WindowGeometry) {
+    if geometry.width == 0 || geometry.height == 0 {
+        return;
+    }
+    window.set_size(slint::PhysicalSize::new(geometry.width, geometry.height));
+    window.set_position(slint::PhysicalPosition::new(geometry.x, geometry.y));
 }
 
 pub(crate) fn default_local_ae_title() -> String {

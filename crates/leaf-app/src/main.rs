@@ -8,10 +8,12 @@ mod viewer;
 
 use anyhow::Result;
 use browser::{
-    apply_browser_settings, default_dimse_port, default_local_ae_title, find_node,
-    load_browser_settings, parse_remote_study_ref, qido_first_int, qido_first_string,
-    refresh_browser, save_browser_settings, validate_browser_settings, BrowserQuery,
-    BrowserSettings, RemoteStudyRef,
+    apply_browser_settings, apply_window_geometry, capture_window_geometry,
+    default_dimse_port, default_local_ae_title, find_node, load_browser_settings,
+    load_window_geometry, parse_remote_study_ref, qido_first_int, qido_first_string,
+    refresh_browser, save_browser_settings, save_window_geometry, validate_browser_settings,
+    BrowserQuery, BrowserSettings, RemoteStudyRef, BROWSER_WINDOW_GEOMETRY_KEY,
+    VIEWER_WINDOW_GEOMETRY_KEY,
 };
 use image::load_from_memory;
 use leaf_core::config::{data_dir, PacsNodeConfig};
@@ -19,6 +21,7 @@ use leaf_core::domain::{InstanceInfo, SeriesInfo, StudyInfo};
 use leaf_core::error::{LeafError, LeafResult};
 use leaf_db::imagebox::Imagebox;
 use leaf_dicom::metadata::import_dicom_file;
+use leaf_dicom::pixel::decode_frame;
 use leaf_net::dicomweb::DicomWebClient;
 use rfd::FileDialog;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
@@ -72,6 +75,9 @@ fn main() -> Result<()> {
 
     // Launch the Slint UI.
     let browser = leaf_ui::StudyBrowserWindow::new()?;
+    if let Some(geometry) = load_window_geometry(&imagebox, BROWSER_WINDOW_GEOMETRY_KEY)? {
+        apply_window_geometry(browser.window(), geometry);
+    }
     apply_browser_settings(&browser, &settings_state.borrow());
     browser.set_connection_status("Local imagebox".into());
     refresh_browser(
@@ -85,6 +91,23 @@ fn main() -> Result<()> {
 
     let open_windows: Rc<RefCell<Vec<leaf_ui::StudyViewerWindow>>> =
         Rc::new(RefCell::new(Vec::new()));
+
+    let imagebox_for_browser_close = imagebox.clone();
+    let browser_weak_for_close = browser.as_weak();
+    browser.window().on_close_requested(move || {
+        if let Some(browser) = browser_weak_for_close.upgrade() {
+            if let Some(geometry) = capture_window_geometry(browser.window()) {
+                if let Err(error) = save_window_geometry(
+                    &imagebox_for_browser_close,
+                    BROWSER_WINDOW_GEOMETRY_KEY,
+                    &geometry,
+                ) {
+                    info!("Failed to save browser window geometry: {}", error);
+                }
+            }
+        }
+        slint::CloseRequestResponse::HideWindow
+    });
 
     // Wire up callbacks.
     let browser_weak = browser.as_weak();
@@ -115,6 +138,7 @@ fn main() -> Result<()> {
         info!("Opening study: {}", study_uid);
         let result = if let Some(remote) = parse_remote_study_ref(study_uid.as_str()) {
             open_remote_viewer_for_study(
+                &imagebox_for_open,
                 &settings_for_open.borrow().pacs_nodes(),
                 &runtime_for_open,
                 &remote,
@@ -306,6 +330,13 @@ fn main() -> Result<()> {
 
     // Run the application.
     browser.run()?;
+    if let Some(geometry) = capture_window_geometry(browser.window()) {
+        if let Err(error) =
+            save_window_geometry(&imagebox, BROWSER_WINDOW_GEOMETRY_KEY, &geometry)
+        {
+            info!("Failed to save browser window geometry: {}", error);
+        }
+    }
 
     info!("pacsleaf shutting down");
     Ok(())
@@ -385,6 +416,19 @@ fn import_from_path(imagebox: &Imagebox, path: &Path) -> LeafResult<ImportSummar
         }
 
         imagebox.store_study(&study, &series_list, &instances)?;
+
+        // Generate thumbnails for each series from the middle slice
+        for series_info in &series_list {
+            let series_uid = &series_info.series_uid.0;
+            let series_instances = accumulator
+                .instances_by_series
+                .get(series_uid)
+                .cloned()
+                .unwrap_or_default();
+            if let Err(e) = generate_and_store_thumbnail(imagebox, series_uid, &series_instances) {
+                info!("Thumbnail generation failed for {}: {}", series_uid, e);
+            }
+        }
     }
 
     Ok(ImportSummary {
@@ -500,6 +544,7 @@ fn cli_import_paths() -> Vec<PathBuf> {
 }
 
 fn open_remote_viewer_for_study(
+    imagebox: &Rc<Imagebox>,
     nodes: &[PacsNodeConfig],
     runtime: &tokio::runtime::Runtime,
     remote: &RemoteStudyRef,
@@ -511,6 +556,9 @@ fn open_remote_viewer_for_study(
 
     let viewer =
         leaf_ui::StudyViewerWindow::new().map_err(|error| LeafError::Render(error.to_string()))?;
+    if let Some(geometry) = load_window_geometry(imagebox, VIEWER_WINDOW_GEOMETRY_KEY)? {
+        apply_window_geometry(viewer.window(), geometry);
+    }
     viewer.set_patient_name(patient_name.into());
     viewer.set_study_description(study_description.into());
     viewer.set_measurement_panel_visible(false);
@@ -539,9 +587,11 @@ fn open_remote_viewer_for_study(
 
     let viewer_weak = viewer.as_weak();
     let viewer_weak_for_volume = viewer.as_weak();
+    let viewer_weak_for_close = viewer.as_weak();
     let series_for_callback = shared_series.clone();
     let client_for_callback = shared_client.clone();
     let study_uid_for_callback = remote_study_uid.clone();
+    let imagebox_for_close = imagebox.clone();
     viewer.on_series_selected(move |series_uid| {
         if let Some(viewer) = viewer_weak.upgrade() {
             set_remote_series_model(&viewer, &series_for_callback, series_uid.as_str());
@@ -560,6 +610,20 @@ fn open_remote_viewer_for_study(
         if let Some(viewer) = viewer_weak_for_volume.upgrade() {
             viewer.set_connection_status("3D preview is only available for local studies".into());
         }
+    });
+    viewer.window().on_close_requested(move || {
+        if let Some(viewer) = viewer_weak_for_close.upgrade() {
+            if let Some(geometry) = capture_window_geometry(viewer.window()) {
+                if let Err(error) = save_window_geometry(
+                    &imagebox_for_close,
+                    VIEWER_WINDOW_GEOMETRY_KEY,
+                    &geometry,
+                ) {
+                    info!("Failed to save viewer window geometry: {}", error);
+                }
+            }
+        }
+        slint::CloseRequestResponse::HideWindow
     });
 
     viewer
@@ -613,6 +677,8 @@ fn set_remote_series_model(
             description: series.description.clone().into(),
             instance_count: series.instance_count,
             active: series.series_uid == active_series_uid,
+            thumbnail: slint::Image::default(),
+            has_thumbnail: false,
         })
         .collect::<Vec<_>>();
     viewer.set_series_list(ModelRc::from(Rc::new(VecModel::from(entries))));
@@ -647,5 +713,62 @@ fn update_remote_viewer_image(
     viewer.set_window_info("Remote render".into());
     viewer.set_slice_info("1/1".into());
     viewer.set_zoom_info("Fit".into());
+    Ok(())
+}
+
+const THUMB_SIZE: usize = 64;
+
+/// Generate a 64×64 RGBA thumbnail from the middle slice of a series and store it in the DB.
+fn generate_and_store_thumbnail(
+    imagebox: &Imagebox,
+    series_uid: &str,
+    instances: &[InstanceInfo],
+) -> LeafResult<()> {
+    if instances.is_empty() {
+        return Ok(());
+    }
+
+    // Pick the middle instance
+    let mid = instances.len() / 2;
+    let instance = &instances[mid];
+    let file_path = instance
+        .file_path
+        .as_ref()
+        .ok_or_else(|| LeafError::NoData("Instance has no file path".into()))?;
+
+    let frame = decode_frame(Path::new(file_path), 0)?;
+    if frame.width == 0 || frame.height == 0 {
+        return Ok(());
+    }
+
+    // Downscale to THUMB_SIZE × THUMB_SIZE using nearest-neighbor (fast)
+    let src_w = frame.width as usize;
+    let src_h = frame.height as usize;
+    let channels = frame.channels as usize;
+    let mut rgba = vec![0u8; THUMB_SIZE * THUMB_SIZE * 4];
+
+    for ty in 0..THUMB_SIZE {
+        for tx in 0..THUMB_SIZE {
+            let sx = (tx * src_w / THUMB_SIZE).min(src_w - 1);
+            let sy = (ty * src_h / THUMB_SIZE).min(src_h - 1);
+            let src_idx = (sy * src_w + sx) * channels;
+            let dst_idx = (ty * THUMB_SIZE + tx) * 4;
+
+            if channels == 1 {
+                let v = frame.pixels[src_idx];
+                rgba[dst_idx] = v;
+                rgba[dst_idx + 1] = v;
+                rgba[dst_idx + 2] = v;
+                rgba[dst_idx + 3] = 255;
+            } else if channels >= 3 {
+                rgba[dst_idx] = frame.pixels[src_idx];
+                rgba[dst_idx + 1] = frame.pixels[src_idx + 1];
+                rgba[dst_idx + 2] = frame.pixels[src_idx + 2];
+                rgba[dst_idx + 3] = 255;
+            }
+        }
+    }
+
+    imagebox.store_thumbnail(series_uid, &rgba)?;
     Ok(())
 }

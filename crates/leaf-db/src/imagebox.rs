@@ -40,6 +40,8 @@ impl Imagebox {
         txn.open_table(STUDY_SERIES_INDEX).map_err(db_err)?;
         txn.open_table(SERIES_INSTANCE_INDEX).map_err(db_err)?;
         txn.open_table(SETTINGS).map_err(db_err)?;
+        txn.open_table(MEASUREMENTS).map_err(db_err)?;
+        txn.open_table(THUMBNAILS).map_err(db_err)?;
         txn.commit().map_err(db_err)?;
         Ok(())
     }
@@ -206,6 +208,38 @@ impl Imagebox {
         Ok(result)
     }
 
+    /// Store all measurements for a series (overwrites previous).
+    pub fn store_measurements(&self, series_uid: &str, measurements_json: &str) -> LeafResult<()> {
+        let txn = self.db.begin_write().map_err(db_err)?;
+        {
+            let mut table = txn.open_table(MEASUREMENTS).map_err(db_err)?;
+            table.insert(series_uid, measurements_json).map_err(db_err)?;
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Load measurements for a series. Returns None if no measurements stored.
+    pub fn load_measurements(&self, series_uid: &str) -> LeafResult<Option<String>> {
+        let txn = self.db.begin_read().map_err(db_err)?;
+        let table = txn.open_table(MEASUREMENTS).map_err(db_err)?;
+        match table.get(series_uid).map_err(db_err)? {
+            Some(val) => Ok(Some(val.value().to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete measurements for a series.
+    pub fn delete_measurements(&self, series_uid: &str) -> LeafResult<()> {
+        let txn = self.db.begin_write().map_err(db_err)?;
+        {
+            let mut table = txn.open_table(MEASUREMENTS).map_err(db_err)?;
+            let _ = table.remove(series_uid);
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(())
+    }
+
     /// Delete a study and all its series/instances from the database.
     pub fn delete_study(&self, study_uid: &StudyUid) -> LeafResult<()> {
         let series = self.get_series_for_study(study_uid)?;
@@ -249,6 +283,20 @@ impl Imagebox {
             }
         }
 
+        // Delete measurements and thumbnails for all series.
+        {
+            let mut meas_table = txn.open_table(MEASUREMENTS).map_err(db_err)?;
+            for s in &series {
+                let _ = meas_table.remove(s.series_uid.0.as_str());
+            }
+        }
+        {
+            let mut thumb_table = txn.open_table(THUMBNAILS).map_err(db_err)?;
+            for s in &series {
+                let _ = thumb_table.remove(s.series_uid.0.as_str());
+            }
+        }
+
         // Delete study.
         {
             let mut studies_table = txn.open_table(STUDIES).map_err(db_err)?;
@@ -281,5 +329,26 @@ impl Imagebox {
         }
         txn.commit().map_err(db_err)?;
         Ok(())
+    }
+
+    /// Store a thumbnail (raw RGBA bytes) for a series.
+    pub fn store_thumbnail(&self, series_uid: &str, rgba_data: &[u8]) -> LeafResult<()> {
+        let txn = self.db.begin_write().map_err(db_err)?;
+        {
+            let mut table = txn.open_table(THUMBNAILS).map_err(db_err)?;
+            table.insert(series_uid, rgba_data).map_err(db_err)?;
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Load a thumbnail for a series. Returns None if no thumbnail stored.
+    pub fn load_thumbnail(&self, series_uid: &str) -> LeafResult<Option<Vec<u8>>> {
+        let txn = self.db.begin_read().map_err(db_err)?;
+        let table = txn.open_table(THUMBNAILS).map_err(db_err)?;
+        match table.get(series_uid).map_err(db_err)? {
+            Some(val) => Ok(Some(val.value().to_vec())),
+            None => Ok(None),
+        }
     }
 }

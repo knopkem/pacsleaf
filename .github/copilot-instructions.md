@@ -2,6 +2,12 @@
 
 **Pure Rust Medical Imaging Viewer** — the companion product to [pacsnode](https://github.com/knopkem/pacsnode).
 
+## Performance
+
+UI responsiveness is a top priority. Every interaction — tool switching, button clicks, drag operations — must feel instant (< 16 ms). Avoid rebuilding Slint models, recalculating layouts, or re-rendering images in response to lightweight state changes. Defer heavy work (GPU renders, model rebuilds) to when it's actually needed. Profile before optimizing, but never ship sluggish UI.
+
+---
+
 ## Code Quality
 
 - Write **production-ready Rust** — no placeholder logic, no `todo!()` left in non-test code, no `unwrap()` or `expect()` outside of tests or `main` startup validation where a panic is acceptable.

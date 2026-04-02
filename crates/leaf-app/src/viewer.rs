@@ -1,5 +1,9 @@
 //! Local viewer state and rendering flow for pacsleaf.
 
+use crate::browser::{
+    apply_window_geometry, capture_window_geometry, load_window_geometry, save_window_geometry,
+    VIEWER_WINDOW_GEOMETRY_KEY,
+};
 use glam::DVec2;
 use leaf_core::domain::{InstanceInfo, SeriesInfo, SeriesUid, StudyUid};
 use leaf_core::error::{LeafError, LeafResult};
@@ -16,12 +20,16 @@ use std::path::Path;
 use std::rc::Rc;
 use tracing::info;
 
+const THUMB_SIZE: usize = 64;
+
 struct ViewerSession {
     viewer: slint::Weak<leaf_ui::StudyViewerWindow>,
+    imagebox: Rc<Imagebox>,
     series: Vec<SeriesInfo>,
     instances_by_series: std::collections::HashMap<String, Vec<InstanceInfo>>,
     frames_by_series: HashMap<String, Vec<FrameRef>>,
     measurements_by_series: HashMap<String, Vec<Measurement>>,
+    thumbnails_by_series: HashMap<String, slint::Image>,
     active_series_uid: String,
     active_frame_index: usize,
     measurement_panel_visible: bool,
@@ -96,7 +104,7 @@ struct ViewportGeometry {
 }
 
 pub(crate) fn open_viewer_for_study(
-    imagebox: &Imagebox,
+    imagebox: &Rc<Imagebox>,
     study_uid: &str,
 ) -> LeafResult<leaf_ui::StudyViewerWindow> {
     let study_uid = StudyUid(study_uid.to_string());
@@ -117,10 +125,49 @@ pub(crate) fn open_viewer_for_study(
         })
         .collect::<std::collections::HashMap<_, _>>();
     let frames_by_series = build_frames_by_series(&instances_by_series);
-    let measurements_by_series = HashMap::new();
+    let mut measurements_by_series = HashMap::new();
+    for series_info in &series {
+        let uid = &series_info.series_uid.0;
+        if let Ok(Some(json)) = imagebox.load_measurements(uid) {
+            if let Ok(measurements) = serde_json::from_str::<Vec<Measurement>>(&json) {
+                if !measurements.is_empty() {
+                    measurements_by_series.insert(uid.clone(), measurements);
+                }
+            }
+        }
+    }
+
+    // Load pre-generated thumbnails from DB, generate on-the-fly if missing
+    let mut thumbnails_by_series = HashMap::new();
+    for series_info in &series {
+        let uid = &series_info.series_uid.0;
+        // Try loading from DB first
+        if let Ok(Some(rgba)) = imagebox.load_thumbnail(uid) {
+            if rgba.len() == THUMB_SIZE * THUMB_SIZE * 4 {
+                if let Ok(img) = leaf_ui::image_from_rgba8(THUMB_SIZE as u32, THUMB_SIZE as u32, rgba) {
+                    thumbnails_by_series.insert(uid.clone(), img);
+                    continue;
+                }
+            }
+        }
+        // Generate lazily from middle frame if not in DB
+        if let Some(instances) = instances_by_series.get(uid) {
+            if let Some(rgba) = generate_thumbnail_rgba(instances) {
+                if let Err(e) = imagebox.store_thumbnail(uid, &rgba) {
+                    info!("Failed to cache thumbnail for {}: {}", uid, e);
+                }
+                if let Ok(img) = leaf_ui::image_from_rgba8(THUMB_SIZE as u32, THUMB_SIZE as u32, rgba) {
+                    thumbnails_by_series.insert(uid.clone(), img);
+                }
+            }
+        }
+    }
 
     let viewer =
         leaf_ui::StudyViewerWindow::new().map_err(|error| LeafError::Render(error.to_string()))?;
+    if let Some(geometry) = load_window_geometry(imagebox, VIEWER_WINDOW_GEOMETRY_KEY)? {
+        apply_window_geometry(viewer.window(), geometry);
+    }
     viewer.set_patient_name(study.patient.patient_name.clone().into());
     viewer.set_connection_status("Local imagebox".into());
     viewer.set_active_tool(leaf_ui::ViewerTool::WindowLevel);
@@ -140,10 +187,12 @@ pub(crate) fn open_viewer_for_study(
         .unwrap_or_default();
     let session = Rc::new(RefCell::new(ViewerSession {
         viewer: viewer.as_weak(),
+        imagebox: imagebox.clone(),
         series,
         instances_by_series,
         frames_by_series,
         measurements_by_series,
+        thumbnails_by_series,
         active_series_uid,
         active_frame_index: 0,
         measurement_panel_visible: false,
@@ -181,6 +230,7 @@ pub(crate) fn open_viewer_for_study(
     {
         let session_ref = session.borrow();
         update_measurements_model(&session_ref)?;
+        let _ = update_measurement_overlays(&session_ref);
     }
 
     let session_for_series = session.clone();
@@ -197,7 +247,9 @@ pub(crate) fn open_viewer_for_study(
             if preview_active {
                 render_or_show_volume_preview(&mut session)
             } else {
-                update_viewer_image(&mut session).and_then(|_| update_measurements_model(&session))
+                update_viewer_image(&mut session)
+                    .and_then(|_| update_measurements_model(&session))
+                    .and_then(|_| update_measurement_overlays(&session))
             }
         });
         if let Err(error) = result {
@@ -307,8 +359,12 @@ pub(crate) fn open_viewer_for_study(
                 }
                 // Check for handle drag on existing measurement
                 if let Some((measurement_id, handle_index)) = find_handle_at(&session, x, y) {
+                    session.selected_measurement_id = Some(measurement_id.clone());
                     session.handle_drag = Some(HandleDrag { measurement_id, handle_index });
                     session.draft_measurement = None;
+                    if let Err(error) = update_measurement_overlays(&session) {
+                        info!("Failed to update overlays on handle select: {}", error);
+                    }
                     return;
                 }
                 // Start new draft
@@ -354,6 +410,7 @@ pub(crate) fn open_viewer_for_study(
             if let Err(error) = result {
                 info!("Failed to finalize handle drag: {}", error);
             }
+            persist_measurements(&session);
             return;
         }
 
@@ -494,6 +551,17 @@ pub(crate) fn open_viewer_for_study(
         }
     });
 
+    let session_for_resize = session.clone();
+    viewer.on_viewport_resized(move |width, height| {
+        let mut session = session_for_resize.borrow_mut();
+        let had_size = session.viewport_width > 0.0 && session.viewport_height > 0.0;
+        update_viewport_dimensions(&mut session, width, height);
+        // Update overlays if this is the first time we have valid dimensions
+        if !had_size && width > 0.0 && height > 0.0 {
+            let _ = update_measurement_overlays(&session);
+        }
+    });
+
     let session_for_reset = session.clone();
     viewer.on_reset_view(move || {
         let mut session = session_for_reset.borrow_mut();
@@ -553,7 +621,7 @@ pub(crate) fn open_viewer_for_study(
         let value_text = measurement_value_text(&selected, active_pixel_spacing(&session));
 
         let result =
-            update_viewer_image(&mut session).and_then(|_| update_measurements_model(&session));
+            update_viewer_image(&mut session).and_then(|_| update_measurements_model(&session)).and_then(|_| update_measurement_overlays(&session));
         if let Err(error) = result {
             info!("Failed to select measurement: {}", error);
             return;
@@ -571,7 +639,33 @@ pub(crate) fn open_viewer_for_study(
         }
     });
 
+    let session_for_delete = session.clone();
+    viewer.on_measurement_deleted(move |measurement_id| {
+        let mut session = session_for_delete.borrow_mut();
+        let measurement_id_str = measurement_id.to_string();
+        let active_uid = session.active_series_uid.clone();
+
+        // Remove from in-memory store
+        if let Some(measurements) = session.measurements_by_series.get_mut(&active_uid) {
+            measurements.retain(|m| m.id != measurement_id_str);
+        }
+
+        // Clear selection if it was selected
+        if session.selected_measurement_id.as_deref() == Some(&measurement_id_str) {
+            session.selected_measurement_id = None;
+        }
+
+        // Persist to DB
+        persist_measurements(&session);
+
+        // Update UI
+        let _ = update_measurements_model(&session);
+        let _ = update_measurement_overlays(&session);
+    });
+
     let session_for_volume_toggle = session.clone();
+    let viewer_weak_for_close = viewer.as_weak();
+    let imagebox_for_close = imagebox.clone();
     viewer.on_toggle_volume_preview(move || {
         let mut session = session_for_volume_toggle.borrow_mut();
         let result = if session.volume_preview_active {
@@ -589,6 +683,20 @@ pub(crate) fn open_viewer_for_study(
             }
         }
     });
+    viewer.window().on_close_requested(move || {
+        if let Some(viewer) = viewer_weak_for_close.upgrade() {
+            if let Some(geometry) = capture_window_geometry(viewer.window()) {
+                if let Err(error) = save_window_geometry(
+                    &imagebox_for_close,
+                    VIEWER_WINDOW_GEOMETRY_KEY,
+                    &geometry,
+                ) {
+                    info!("Failed to save viewer window geometry: {}", error);
+                }
+            }
+        }
+        slint::CloseRequestResponse::HideWindow
+    });
 
     viewer
         .show()
@@ -600,21 +708,30 @@ fn update_series_model(session: &ViewerSession) -> LeafResult<()> {
     let entries = session
         .series
         .iter()
-        .map(|series| leaf_ui::SeriesThumbnail {
-            series_uid: series.series_uid.0.clone().into(),
-            series_number: series.series_number.unwrap_or_default(),
-            modality: series.modality.clone().into(),
-            description: series
-                .series_description
-                .clone()
-                .unwrap_or_else(|| "-".to_string())
-                .into(),
-            instance_count: session
-                .instances_by_series
-                .get(&series.series_uid.0)
-                .map(|instances| instances.len() as i32)
-                .unwrap_or(0),
-            active: series.series_uid.0 == session.active_series_uid,
+        .map(|series| {
+            let uid = &series.series_uid.0;
+            let (thumbnail, has_thumbnail) = match session.thumbnails_by_series.get(uid) {
+                Some(img) => (img.clone(), true),
+                None => (slint::Image::default(), false),
+            };
+            leaf_ui::SeriesThumbnail {
+                series_uid: uid.clone().into(),
+                series_number: series.series_number.unwrap_or_default(),
+                modality: series.modality.clone().into(),
+                description: series
+                    .series_description
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string())
+                    .into(),
+                instance_count: session
+                    .instances_by_series
+                    .get(uid)
+                    .map(|instances| instances.len() as i32)
+                    .unwrap_or(0),
+                active: *uid == session.active_series_uid,
+                thumbnail,
+                has_thumbnail,
+            }
         })
         .collect::<Vec<_>>();
     session
@@ -1084,12 +1201,26 @@ fn finalize_measurement(session: &mut ViewerSession) -> LeafResult<()> {
 
     update_measurements_model(session)?;
     update_measurement_overlays(session)?;
+    persist_measurements(session);
 
     if let Some(viewer) = session.viewer.upgrade() {
         viewer.set_connection_status(format!("Created {} {}", kind_label, value_text).into());
     }
 
     Ok(())
+}
+
+fn persist_measurements(session: &ViewerSession) {
+    let series_uid = &session.active_series_uid;
+    if let Some(measurements) = session.measurements_by_series.get(series_uid) {
+        if let Ok(json) = serde_json::to_string(measurements) {
+            if let Err(e) = session.imagebox.store_measurements(series_uid, &json) {
+                info!("Failed to persist measurements: {}", e);
+            }
+        }
+    } else {
+        let _ = session.imagebox.delete_measurements(series_uid);
+    }
 }
 
 fn image_to_viewport_point(session: &ViewerSession, point: DVec2) -> Option<(f32, f32)> {
@@ -1609,11 +1740,58 @@ fn to_rgba(frame: &leaf_dicom::pixel::DecodedFrame) -> LeafResult<Vec<u8>> {
     }
 }
 
+/// Generate a THUMB_SIZE×THUMB_SIZE RGBA thumbnail from the middle instance of a series.
+fn generate_thumbnail_rgba(instances: &[InstanceInfo]) -> Option<Vec<u8>> {
+    if instances.is_empty() {
+        return None;
+    }
+    let mid = instances.len() / 2;
+    let file_path = instances[mid].file_path.as_ref()?;
+    let frame = decode_frame_with_window(Path::new(file_path), 0, None).ok()?;
+    if frame.width == 0 || frame.height == 0 {
+        return None;
+    }
+
+    let src_w = frame.width as usize;
+    let src_h = frame.height as usize;
+    let channels = frame.channels as usize;
+    let mut rgba = vec![0u8; THUMB_SIZE * THUMB_SIZE * 4];
+
+    for ty in 0..THUMB_SIZE {
+        for tx in 0..THUMB_SIZE {
+            let sx = (tx * src_w / THUMB_SIZE).min(src_w - 1);
+            let sy = (ty * src_h / THUMB_SIZE).min(src_h - 1);
+            let src_idx = (sy * src_w + sx) * channels;
+            let dst_idx = (ty * THUMB_SIZE + tx) * 4;
+
+            if channels == 1 {
+                let v = frame.pixels[src_idx];
+                rgba[dst_idx] = v;
+                rgba[dst_idx + 1] = v;
+                rgba[dst_idx + 2] = v;
+                rgba[dst_idx + 3] = 255;
+            } else if channels >= 3 {
+                rgba[dst_idx] = frame.pixels[src_idx];
+                rgba[dst_idx + 1] = frame.pixels[src_idx + 1];
+                rgba[dst_idx + 2] = frame.pixels[src_idx + 2];
+                rgba[dst_idx + 3] = 255;
+            }
+        }
+    }
+
+    Some(rgba)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use leaf_core::domain::{SeriesUid, SopInstanceUid, StudyUid};
     use leaf_tools::measurement::Measurement;
+
+    fn test_imagebox() -> Rc<Imagebox> {
+        let path = std::env::temp_dir().join("pacsleaf_test_viewer.redb");
+        Rc::new(Imagebox::open(&path).expect("Failed to open test imagebox"))
+    }
 
     fn instance(
         sop_uid: &str,
@@ -1688,10 +1866,12 @@ mod tests {
     fn preview_dimensions_keep_output_size_stable() {
         let session = ViewerSession {
             viewer: slint::Weak::default(),
+            imagebox: test_imagebox(),
             series: Vec::new(),
             instances_by_series: HashMap::new(),
             frames_by_series: HashMap::new(),
             measurements_by_series: HashMap::new(),
+            thumbnails_by_series: HashMap::new(),
             active_series_uid: String::new(),
             active_frame_index: 0,
             measurement_panel_visible: false,

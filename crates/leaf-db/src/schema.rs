@@ -22,5 +22,11 @@ pub const STUDY_SERIES_INDEX: TableDefinition<&str, &str> =
 pub const SERIES_INSTANCE_INDEX: TableDefinition<&str, &str> =
     TableDefinition::new("idx_series_instances");
 
+/// Measurements table: SeriesUID → JSON array of Measurement objects.
+pub const MEASUREMENTS: TableDefinition<&str, &str> = TableDefinition::new("measurements");
+
+/// Thumbnails table: SeriesUID → raw RGBA pixel data (64×64, 4 bytes/pixel).
+pub const THUMBNAILS: TableDefinition<&str, &[u8]> = TableDefinition::new("thumbnails");
+
 /// Settings table: key → value (string).
 pub const SETTINGS: TableDefinition<&str, &str> = TableDefinition::new("settings");
