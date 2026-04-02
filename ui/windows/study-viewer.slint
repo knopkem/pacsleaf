@@ -45,6 +45,11 @@ export struct MeasurementOverlay {
     label: string,
     selected: bool,
     draft: bool,
+    handle-count: int,
+    h1-x: float, h1-y: float,
+    h2-x: float, h2-y: float,
+    h3-x: float, h3-y: float,
+    h4-x: float, h4-y: float,
 }
 
 export component StudyViewerWindow inherits Window {
@@ -300,6 +305,82 @@ export component StudyViewerWindow inherits Window {
                         text: overlay.label;
                         color: overlay.selected ? Theme.accent-hover : Theme.accent-gold;
                         font-size: Theme.font-xs;
+                    }
+
+                    // Handles for selected measurements
+                    for overlay[idx] in measurement-overlays: Rectangle {
+                        visible: overlay.handle-count >= 1 && overlay.selected;
+                        x: overlay.h1-x * 1px - 4px;
+                        y: overlay.h1-y * 1px - 4px;
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: Theme.accent-hover;
+                    }
+                    for overlay[idx] in measurement-overlays: Rectangle {
+                        visible: overlay.handle-count >= 2 && overlay.selected;
+                        x: overlay.h2-x * 1px - 4px;
+                        y: overlay.h2-y * 1px - 4px;
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: Theme.accent-hover;
+                    }
+                    for overlay[idx] in measurement-overlays: Rectangle {
+                        visible: overlay.handle-count >= 3 && overlay.selected;
+                        x: overlay.h3-x * 1px - 4px;
+                        y: overlay.h3-y * 1px - 4px;
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: Theme.accent-hover;
+                    }
+                    for overlay[idx] in measurement-overlays: Rectangle {
+                        visible: overlay.handle-count >= 4 && overlay.selected;
+                        x: overlay.h4-x * 1px - 4px;
+                        y: overlay.h4-y * 1px - 4px;
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: Theme.accent-hover;
+                    }
+
+                    // Handles for draft measurements
+                    for overlay[idx] in measurement-overlays: Rectangle {
+                        visible: overlay.handle-count >= 1 && overlay.draft;
+                        x: overlay.h1-x * 1px - 3px;
+                        y: overlay.h1-y * 1px - 3px;
+                        width: 6px;
+                        height: 6px;
+                        border-radius: 3px;
+                        background: #D9A03CAA;
+                    }
+                    for overlay[idx] in measurement-overlays: Rectangle {
+                        visible: overlay.handle-count >= 2 && overlay.draft;
+                        x: overlay.h2-x * 1px - 3px;
+                        y: overlay.h2-y * 1px - 3px;
+                        width: 6px;
+                        height: 6px;
+                        border-radius: 3px;
+                        background: #D9A03CAA;
+                    }
+                    for overlay[idx] in measurement-overlays: Rectangle {
+                        visible: overlay.handle-count >= 3 && overlay.draft;
+                        x: overlay.h3-x * 1px - 3px;
+                        y: overlay.h3-y * 1px - 3px;
+                        width: 6px;
+                        height: 6px;
+                        border-radius: 3px;
+                        background: #D9A03CAA;
+                    }
+                    for overlay[idx] in measurement-overlays: Rectangle {
+                        visible: overlay.handle-count >= 4 && overlay.draft;
+                        x: overlay.h4-x * 1px - 3px;
+                        y: overlay.h4-y * 1px - 3px;
+                        width: 6px;
+                        height: 6px;
+                        border-radius: 3px;
+                        background: #D9A03CAA;
                     }
 
                     Text {

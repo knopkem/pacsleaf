@@ -40,6 +40,7 @@ struct ViewerSession {
     active_frame_height: u32,
     selected_measurement_id: Option<String>,
     draft_measurement: Option<DraftMeasurement>,
+    handle_drag: Option<HandleDrag>,
     drag_state: Option<ViewportDragState>,
     volume_drag_state: Option<VolumeDragState>,
     volume_renderer: Option<VolumePreviewRenderer>,
@@ -73,9 +74,17 @@ struct VolumeDragState {
 }
 
 #[derive(Clone)]
-struct DraftMeasurement {
-    start: DVec2,
-    end: DVec2,
+enum DraftMeasurement {
+    Line { start: DVec2, end: DVec2 },
+    Angle { vertex: DVec2, arm1: DVec2, arm2: Option<DVec2> },
+    Rectangle { corner1: DVec2, corner2: DVec2 },
+    Ellipse { center: DVec2, corner: DVec2 },
+}
+
+#[derive(Clone)]
+struct HandleDrag {
+    measurement_id: String,
+    handle_index: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -153,6 +162,7 @@ pub(crate) fn open_viewer_for_study(
         active_frame_height: 0,
         selected_measurement_id: None,
         draft_measurement: None,
+        handle_drag: None,
         drag_state: None,
         volume_drag_state: None,
         volume_renderer: None,
@@ -181,6 +191,7 @@ pub(crate) fn open_viewer_for_study(
         session.active_frame_index = 0;
         session.selected_measurement_id = None;
         session.draft_measurement = None;
+        session.handle_drag = None;
         reset_viewport_state(&mut session, true);
         let result = update_series_model(&session).and_then(|_| {
             if preview_active {
@@ -202,6 +213,7 @@ pub(crate) fn open_viewer_for_study(
         session.drag_state = None;
         session.volume_drag_state = None;
         session.draft_measurement = None;
+        session.handle_drag = None;
         // Only rebuild measurement overlays when a draft measurement was cleared;
         // otherwise the overlays haven't changed and the Slint model rebuild is
         // pure overhead.
@@ -279,17 +291,45 @@ pub(crate) fn open_viewer_for_study(
                     start_window_width: session.window_width.unwrap_or(1.0),
                 });
             }
-            leaf_ui::ViewerTool::Line => {
+            leaf_ui::ViewerTool::Line
+            | leaf_ui::ViewerTool::Angle
+            | leaf_ui::ViewerTool::RectangleRoi
+            | leaf_ui::ViewerTool::EllipseRoi => {
                 session.drag_state = None;
-                session.draft_measurement = viewport_to_image_point(&session, x, y, false)
-                    .map(|start| DraftMeasurement { start, end: start });
+                // If in angle phase 2, continue with arm2
+                if matches!(&session.draft_measurement, Some(DraftMeasurement::Angle { arm2: Some(_), .. })) {
+                    if let Some(point) = viewport_to_image_point(&session, x, y, false) {
+                        if let Some(DraftMeasurement::Angle { arm2, .. }) = session.draft_measurement.as_mut() {
+                            *arm2 = Some(point);
+                        }
+                    }
+                    return;
+                }
+                // Check for handle drag on existing measurement
+                if let Some((measurement_id, handle_index)) = find_handle_at(&session, x, y) {
+                    session.handle_drag = Some(HandleDrag { measurement_id, handle_index });
+                    session.draft_measurement = None;
+                    return;
+                }
+                // Start new draft
+                let Some(point) = viewport_to_image_point(&session, x, y, false) else {
+                    return;
+                };
+                session.draft_measurement = Some(match session.active_tool {
+                    leaf_ui::ViewerTool::Line => DraftMeasurement::Line { start: point, end: point },
+                    leaf_ui::ViewerTool::Angle => DraftMeasurement::Angle { vertex: point, arm1: point, arm2: None },
+                    leaf_ui::ViewerTool::RectangleRoi => DraftMeasurement::Rectangle { corner1: point, corner2: point },
+                    leaf_ui::ViewerTool::EllipseRoi => DraftMeasurement::Ellipse { center: point, corner: point },
+                    _ => unreachable!(),
+                });
                 if let Err(error) = update_measurement_overlays(&session) {
-                    info!("Failed to begin line measurement: {}", error);
+                    info!("Failed to begin measurement: {}", error);
                 }
             }
             _ => {
                 session.drag_state = None;
                 session.draft_measurement = None;
+                session.handle_drag = None;
             }
         }
     });
@@ -306,18 +346,61 @@ pub(crate) fn open_viewer_for_study(
             return;
         }
 
-        if matches!(session.active_tool, leaf_ui::ViewerTool::Line) {
-            if let Some(end) = viewport_to_image_point(&session, x, y, true) {
-                if let Some(draft) = session.draft_measurement.as_mut() {
-                    draft.end = end;
+        // Finalize handle drag
+        if session.handle_drag.is_some() {
+            session.handle_drag = None;
+            let result = update_measurements_model(&session)
+                .and_then(|_| update_measurement_overlays(&session));
+            if let Err(error) = result {
+                info!("Failed to finalize handle drag: {}", error);
+            }
+            return;
+        }
+
+        match session.active_tool {
+            leaf_ui::ViewerTool::Line
+            | leaf_ui::ViewerTool::RectangleRoi
+            | leaf_ui::ViewerTool::EllipseRoi => {
+                if let Some(point) = viewport_to_image_point(&session, x, y, true) {
+                    match session.draft_measurement.as_mut() {
+                        Some(DraftMeasurement::Line { end, .. }) => *end = point,
+                        Some(DraftMeasurement::Rectangle { corner2, .. }) => *corner2 = point,
+                        Some(DraftMeasurement::Ellipse { corner, .. }) => *corner = point,
+                        _ => {}
+                    }
+                }
+                if let Err(error) = finalize_measurement(&mut session) {
+                    info!("Failed to finalize measurement: {}", error);
                 }
             }
-
-            if let Err(error) = finalize_line_measurement(&mut session) {
-                info!("Failed to finalize line measurement: {}", error);
+            leaf_ui::ViewerTool::Angle => {
+                let was_phase_2 = matches!(
+                    &session.draft_measurement,
+                    Some(DraftMeasurement::Angle { arm2: Some(_), .. })
+                );
+                if let Some(point) = viewport_to_image_point(&session, x, y, true) {
+                    if let Some(DraftMeasurement::Angle { arm1, arm2, .. }) =
+                        session.draft_measurement.as_mut()
+                    {
+                        if arm2.is_none() {
+                            *arm1 = point;
+                            *arm2 = Some(point);
+                        } else {
+                            *arm2 = Some(point);
+                        }
+                    }
+                }
+                if was_phase_2 {
+                    if let Err(error) = finalize_measurement(&mut session) {
+                        info!("Failed to finalize angle measurement: {}", error);
+                    }
+                } else if let Err(error) = update_measurement_overlays(&session) {
+                    info!("Failed to update angle measurement: {}", error);
+                }
             }
-        } else {
-            session.drag_state = None;
+            _ => {
+                session.drag_state = None;
+            }
         }
     });
 
@@ -338,15 +421,41 @@ pub(crate) fn open_viewer_for_study(
             return;
         }
 
-        if matches!(session.active_tool, leaf_ui::ViewerTool::Line) {
-            if let Some(end) = viewport_to_image_point(&session, x, y, true) {
-                if let Some(draft) = session.draft_measurement.as_mut() {
-                    draft.end = end;
+        // Handle drag on existing measurement handle
+        if let Some(handle_drag) = session.handle_drag.clone() {
+            if let Some(point) = viewport_to_image_point(&session, x, y, true) {
+                let series_uid = session.active_series_uid.clone();
+                if let Some(measurements) = session.measurements_by_series.get_mut(&series_uid) {
+                    if let Some(m) = measurements.iter_mut().find(|m| m.id == handle_drag.measurement_id) {
+                        m.set_handle_position(handle_drag.handle_index, point);
+                    }
                 }
             }
-
             if let Err(error) = update_measurement_overlays(&session) {
-                info!("Failed to update line measurement preview: {}", error);
+                info!("Failed to update handle drag: {}", error);
+            }
+            return;
+        }
+
+        // Update draft measurement preview
+        if session.draft_measurement.is_some() {
+            if let Some(point) = viewport_to_image_point(&session, x, y, true) {
+                match session.draft_measurement.as_mut() {
+                    Some(DraftMeasurement::Line { end, .. }) => *end = point,
+                    Some(DraftMeasurement::Angle { arm1, arm2, .. }) => {
+                        if arm2.is_none() {
+                            *arm1 = point;
+                        } else {
+                            *arm2 = Some(point);
+                        }
+                    }
+                    Some(DraftMeasurement::Rectangle { corner2, .. }) => *corner2 = point,
+                    Some(DraftMeasurement::Ellipse { corner, .. }) => *corner = point,
+                    _ => {}
+                }
+            }
+            if let Err(error) = update_measurement_overlays(&session) {
+                info!("Failed to update measurement preview: {}", error);
             }
             return;
         }
@@ -395,6 +504,7 @@ pub(crate) fn open_viewer_for_study(
             session.active_frame_index = 0;
             session.selected_measurement_id = None;
             session.draft_measurement = None;
+            session.handle_drag = None;
             reset_viewport_state(&mut session, false);
             update_viewer_image(&mut session).and_then(|_| update_measurements_model(&session))
         };
@@ -680,6 +790,17 @@ fn update_measurement_overlays(session: &ViewerSession) -> LeafResult<()> {
         viewer.set_measurement_overlays(empty_measurement_overlay_model());
         return Ok(());
     }
+
+    let has_visible = session
+        .measurements_by_series
+        .get(&session.active_series_uid)
+        .map(|m| m.iter().any(|m| m.slice_index == session.active_frame_index))
+        .unwrap_or(false);
+    if !has_visible && session.draft_measurement.is_none() {
+        viewer.set_measurement_overlays(empty_measurement_overlay_model());
+        return Ok(());
+    }
+
     let pixel_spacing = active_pixel_spacing(session);
 
     let mut overlays = session
@@ -689,12 +810,10 @@ fn update_measurement_overlays(session: &ViewerSession) -> LeafResult<()> {
         .flat_map(|measurements| measurements.iter())
         .filter(|measurement| measurement.slice_index == session.active_frame_index)
         .filter_map(|measurement| {
-            let label = measurement_value_text(measurement, pixel_spacing);
-            measurement_overlay(
+            measurement_to_overlay(
                 session,
-                &measurement.id,
-                measurement_line_points(measurement)?,
-                label,
+                measurement,
+                pixel_spacing,
                 session.selected_measurement_id.as_deref() == Some(measurement.id.as_str()),
                 false,
             )
@@ -702,15 +821,21 @@ fn update_measurement_overlays(session: &ViewerSession) -> LeafResult<()> {
         .collect::<Vec<_>>();
 
     if let Some(draft) = session.draft_measurement.as_ref() {
-        let draft_distance = line_distance_mm(draft.start, draft.end, pixel_spacing);
-        if let Some(overlay) = measurement_overlay(
-            session,
-            "draft-line",
-            (draft.start, draft.end),
-            format_distance_mm(draft_distance),
-            false,
-            true,
-        ) {
+        let temp = match draft {
+            DraftMeasurement::Line { start, end } => Measurement::line("", 0, *start, *end),
+            DraftMeasurement::Angle { vertex, arm1, arm2 } => {
+                Measurement::angle("", 0, *vertex, *arm1, arm2.unwrap_or(*arm1))
+            }
+            DraftMeasurement::Rectangle { corner1, corner2 } => {
+                Measurement::rectangle_roi("", 0, *corner1, *corner2)
+            }
+            DraftMeasurement::Ellipse { center, corner } => {
+                let rx = (corner.x - center.x).abs().max(0.1);
+                let ry = (corner.y - center.y).abs().max(0.1);
+                Measurement::ellipse_roi("", 0, *center, rx, ry)
+            }
+        };
+        if let Some(overlay) = measurement_to_overlay(session, &temp, pixel_spacing, false, true) {
             overlays.push(overlay);
         }
     }
@@ -719,58 +844,228 @@ fn update_measurement_overlays(session: &ViewerSession) -> LeafResult<()> {
     Ok(())
 }
 
-fn measurement_line_points(measurement: &Measurement) -> Option<(DVec2, DVec2)> {
+fn measurement_to_overlay(
+    session: &ViewerSession,
+    measurement: &Measurement,
+    pixel_spacing: (f64, f64),
+    selected: bool,
+    draft: bool,
+) -> Option<leaf_ui::MeasurementOverlay> {
+    let label = measurement_value_text(measurement, pixel_spacing);
     match &measurement.kind {
-        MeasurementKind::Line { start, end } => Some((*start, *end)),
+        MeasurementKind::Line { start, end } => {
+            let (sx, sy) = image_to_viewport_point(session, *start)?;
+            let (ex, ey) = image_to_viewport_point(session, *end)?;
+            let dx = ex - sx;
+            let dy = ey - sy;
+            if (dx * dx + dy * dy).sqrt() < 1.0 {
+                return None;
+            }
+            Some(leaf_ui::MeasurementOverlay {
+                id: measurement.id.clone().into(),
+                commands: format!("M {sx:.1} {sy:.1} L {ex:.1} {ey:.1}").into(),
+                label_x: ex + 6.0,
+                label_y: (ey - 16.0).max(6.0),
+                label: label.into(),
+                selected,
+                draft,
+                handle_count: 2,
+                h1_x: sx,
+                h1_y: sy,
+                h2_x: ex,
+                h2_y: ey,
+                h3_x: 0.0,
+                h3_y: 0.0,
+                h4_x: 0.0,
+                h4_y: 0.0,
+            })
+        }
+        MeasurementKind::Angle { vertex, arm1, arm2 } => {
+            let (vx, vy) = image_to_viewport_point(session, *vertex)?;
+            let (a1x, a1y) = image_to_viewport_point(session, *arm1)?;
+            let (a2x, a2y) = image_to_viewport_point(session, *arm2)?;
+            Some(leaf_ui::MeasurementOverlay {
+                id: measurement.id.clone().into(),
+                commands: format!(
+                    "M {a1x:.1} {a1y:.1} L {vx:.1} {vy:.1} L {a2x:.1} {a2y:.1}"
+                )
+                .into(),
+                label_x: vx + 6.0,
+                label_y: (vy - 16.0).max(6.0),
+                label: label.into(),
+                selected,
+                draft,
+                handle_count: 3,
+                h1_x: vx,
+                h1_y: vy,
+                h2_x: a1x,
+                h2_y: a1y,
+                h3_x: a2x,
+                h3_y: a2y,
+                h4_x: 0.0,
+                h4_y: 0.0,
+            })
+        }
+        MeasurementKind::RectangleRoi {
+            top_left,
+            bottom_right,
+        } => {
+            let (x1, y1) = image_to_viewport_point(session, *top_left)?;
+            let (x2, y2) = image_to_viewport_point(session, *bottom_right)?;
+            Some(leaf_ui::MeasurementOverlay {
+                id: measurement.id.clone().into(),
+                commands: format!(
+                    "M {x1:.1} {y1:.1} L {x2:.1} {y1:.1} L {x2:.1} {y2:.1} L {x1:.1} {y2:.1} Z"
+                )
+                .into(),
+                label_x: x2 + 6.0,
+                label_y: (y1 - 16.0).max(6.0),
+                label: label.into(),
+                selected,
+                draft,
+                handle_count: 4,
+                h1_x: x1,
+                h1_y: y1,
+                h2_x: x2,
+                h2_y: y1,
+                h3_x: x2,
+                h3_y: y2,
+                h4_x: x1,
+                h4_y: y2,
+            })
+        }
+        MeasurementKind::EllipseRoi {
+            center,
+            radius_x,
+            radius_y,
+        } => {
+            let (cx, cy) = image_to_viewport_point(session, *center)?;
+            let corner = DVec2::new(center.x + radius_x, center.y + radius_y);
+            let (corner_x, corner_y) = image_to_viewport_point(session, corner)?;
+            let rx_vp = (corner_x - cx).abs();
+            let ry_vp = (corner_y - cy).abs();
+            if rx_vp < 1.0 || ry_vp < 1.0 {
+                return None;
+            }
+            let commands = format!(
+                "M {:.1} {:.1} A {:.1} {:.1} 0 1 0 {:.1} {:.1} A {:.1} {:.1} 0 1 0 {:.1} {:.1}",
+                cx - rx_vp,
+                cy,
+                rx_vp,
+                ry_vp,
+                cx + rx_vp,
+                cy,
+                rx_vp,
+                ry_vp,
+                cx - rx_vp,
+                cy
+            );
+            Some(leaf_ui::MeasurementOverlay {
+                id: measurement.id.clone().into(),
+                commands: commands.into(),
+                label_x: cx + rx_vp + 6.0,
+                label_y: (cy - 16.0).max(6.0),
+                label: label.into(),
+                selected,
+                draft,
+                handle_count: 2,
+                h1_x: cx,
+                h1_y: cy,
+                h2_x: cx + rx_vp,
+                h2_y: cy + ry_vp,
+                h3_x: 0.0,
+                h3_y: 0.0,
+                h4_x: 0.0,
+                h4_y: 0.0,
+            })
+        }
         _ => None,
     }
 }
 
-fn measurement_overlay(
-    session: &ViewerSession,
-    id: &str,
-    points: (DVec2, DVec2),
-    label: String,
-    selected: bool,
-    draft: bool,
-) -> Option<leaf_ui::MeasurementOverlay> {
-    let (start, end) = points;
-    let (start_x, start_y) = image_to_viewport_point(session, start)?;
-    let (end_x, end_y) = image_to_viewport_point(session, end)?;
-    let dx = end_x - start_x;
-    let dy = end_y - start_y;
-    if (dx * dx + dy * dy).sqrt() < 1.0 {
-        return None;
+fn find_handle_at(session: &ViewerSession, x: f32, y: f32) -> Option<(String, usize)> {
+    let threshold_sq = 64.0f32; // 8px radius
+    let measurements = session
+        .measurements_by_series
+        .get(&session.active_series_uid)?;
+    for measurement in measurements
+        .iter()
+        .filter(|m| m.slice_index == session.active_frame_index)
+    {
+        let handles = measurement.handle_positions();
+        for (idx, handle) in handles.iter().enumerate() {
+            if let Some((hx, hy)) = image_to_viewport_point(session, *handle) {
+                let dx = hx - x;
+                let dy = hy - y;
+                if dx * dx + dy * dy <= threshold_sq {
+                    return Some((measurement.id.clone(), idx));
+                }
+            }
+        }
     }
-
-    Some(leaf_ui::MeasurementOverlay {
-        id: id.into(),
-        commands: format!("M {start_x:.2} {start_y:.2} L {end_x:.2} {end_y:.2}").into(),
-        label_x: end_x + 6.0,
-        label_y: (end_y - 16.0).max(6.0),
-        label: label.into(),
-        selected,
-        draft,
-    })
+    None
 }
 
-fn finalize_line_measurement(session: &mut ViewerSession) -> LeafResult<()> {
+fn finalize_measurement(session: &mut ViewerSession) -> LeafResult<()> {
     session.drag_state = None;
 
     let Some(draft) = session.draft_measurement.take() else {
         return update_measurement_overlays(session);
     };
 
-    if (draft.end - draft.start).length() < 2.0 {
-        return update_measurement_overlays(session);
-    }
+    let measurement = match draft {
+        DraftMeasurement::Line { start, end } => {
+            if (end - start).length() < 2.0 {
+                return update_measurement_overlays(session);
+            }
+            Measurement::line(
+                &session.active_series_uid,
+                session.active_frame_index,
+                start,
+                end,
+            )
+        }
+        DraftMeasurement::Angle { vertex, arm1, arm2 } => {
+            let arm2 = arm2.unwrap_or(arm1);
+            if (arm1 - vertex).length() < 2.0 || (arm2 - vertex).length() < 2.0 {
+                return update_measurement_overlays(session);
+            }
+            Measurement::angle(
+                &session.active_series_uid,
+                session.active_frame_index,
+                vertex,
+                arm1,
+                arm2,
+            )
+        }
+        DraftMeasurement::Rectangle { corner1, corner2 } => {
+            if (corner2 - corner1).length() < 2.0 {
+                return update_measurement_overlays(session);
+            }
+            Measurement::rectangle_roi(
+                &session.active_series_uid,
+                session.active_frame_index,
+                corner1,
+                corner2,
+            )
+        }
+        DraftMeasurement::Ellipse { center, corner } => {
+            let rx = (corner.x - center.x).abs();
+            let ry = (corner.y - center.y).abs();
+            if rx < 1.0 || ry < 1.0 {
+                return update_measurement_overlays(session);
+            }
+            Measurement::ellipse_roi(
+                &session.active_series_uid,
+                session.active_frame_index,
+                center,
+                rx,
+                ry,
+            )
+        }
+    };
 
-    let measurement = Measurement::line(
-        &session.active_series_uid,
-        session.active_frame_index,
-        draft.start,
-        draft.end,
-    );
+    let kind_label = measurement_kind_label(&measurement);
     let value_text = measurement_value_text(&measurement, active_pixel_spacing(session));
     let active_series_uid = session.active_series_uid.clone();
     session.selected_measurement_id = Some(measurement.id.clone());
@@ -778,7 +1073,7 @@ fn finalize_line_measurement(session: &mut ViewerSession) -> LeafResult<()> {
         .measurements_by_series
         .entry(active_series_uid)
         .or_default()
-        .push(measurement.clone());
+        .push(measurement);
 
     if !session.measurement_panel_visible {
         session.measurement_panel_visible = true;
@@ -791,7 +1086,7 @@ fn finalize_line_measurement(session: &mut ViewerSession) -> LeafResult<()> {
     update_measurement_overlays(session)?;
 
     if let Some(viewer) = session.viewer.upgrade() {
-        viewer.set_connection_status(format!("Created line {}", value_text).into());
+        viewer.set_connection_status(format!("Created {} {}", kind_label, value_text).into());
     }
 
     Ok(())
@@ -875,12 +1170,6 @@ fn displayed_image_geometry(
         image_width,
         image_height,
     })
-}
-
-fn line_distance_mm(start: DVec2, end: DVec2, pixel_spacing: (f64, f64)) -> f64 {
-    let dx = (end.x - start.x) * pixel_spacing.1;
-    let dy = (end.y - start.y) * pixel_spacing.0;
-    (dx * dx + dy * dy).sqrt()
 }
 
 pub(crate) fn install_viewer_tool_state(viewer: &leaf_ui::StudyViewerWindow) {
@@ -1421,6 +1710,7 @@ mod tests {
             active_frame_height: 0,
             selected_measurement_id: None,
             draft_measurement: None,
+            handle_drag: None,
             drag_state: None,
             volume_drag_state: None,
             volume_renderer: None,

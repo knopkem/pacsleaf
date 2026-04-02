@@ -108,6 +108,121 @@ impl Measurement {
         }
     }
 
+    /// Create a new rectangle ROI measurement.
+    pub fn rectangle_roi(
+        series_uid: &str,
+        slice_index: usize,
+        top_left: DVec2,
+        bottom_right: DVec2,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            kind: MeasurementKind::RectangleRoi {
+                top_left,
+                bottom_right,
+            },
+            label: None,
+            series_uid: series_uid.to_string(),
+            slice_index,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Create a new ellipse ROI measurement.
+    pub fn ellipse_roi(
+        series_uid: &str,
+        slice_index: usize,
+        center: DVec2,
+        radius_x: f64,
+        radius_y: f64,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            kind: MeasurementKind::EllipseRoi {
+                center,
+                radius_x,
+                radius_y,
+            },
+            label: None,
+            series_uid: series_uid.to_string(),
+            slice_index,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Returns the control point positions for this measurement (in image coordinates).
+    pub fn handle_positions(&self) -> Vec<DVec2> {
+        match &self.kind {
+            MeasurementKind::Line { start, end } => vec![*start, *end],
+            MeasurementKind::Angle { vertex, arm1, arm2 } => vec![*vertex, *arm1, *arm2],
+            MeasurementKind::RectangleRoi {
+                top_left,
+                bottom_right,
+            } => vec![
+                *top_left,
+                DVec2::new(bottom_right.x, top_left.y),
+                *bottom_right,
+                DVec2::new(top_left.x, bottom_right.y),
+            ],
+            MeasurementKind::EllipseRoi {
+                center,
+                radius_x,
+                radius_y,
+            } => vec![*center, DVec2::new(center.x + radius_x, center.y + radius_y)],
+            _ => vec![],
+        }
+    }
+
+    /// Update the position of a specific handle (by index). Returns true if valid.
+    pub fn set_handle_position(&mut self, handle_index: usize, pos: DVec2) -> bool {
+        match (&mut self.kind, handle_index) {
+            (MeasurementKind::Line { start, .. }, 0) => {
+                *start = pos;
+                true
+            }
+            (MeasurementKind::Line { end, .. }, 1) => {
+                *end = pos;
+                true
+            }
+            (MeasurementKind::Angle { vertex, .. }, 0) => {
+                *vertex = pos;
+                true
+            }
+            (MeasurementKind::Angle { arm1, .. }, 1) => {
+                *arm1 = pos;
+                true
+            }
+            (MeasurementKind::Angle { arm2, .. }, 2) => {
+                *arm2 = pos;
+                true
+            }
+            (MeasurementKind::RectangleRoi {
+                top_left,
+                bottom_right,
+            }, idx) => match idx {
+                0 => { *top_left = pos; true }
+                1 => { top_left.y = pos.y; bottom_right.x = pos.x; true }
+                2 => { *bottom_right = pos; true }
+                3 => { top_left.x = pos.x; bottom_right.y = pos.y; true }
+                _ => false,
+            },
+            (MeasurementKind::EllipseRoi { center, .. }, 0) => {
+                *center = pos;
+                true
+            }
+            (MeasurementKind::EllipseRoi {
+                center,
+                radius_x,
+                radius_y,
+            }, 1) => {
+                *radius_x = (pos.x - center.x).abs().max(1.0);
+                *radius_y = (pos.y - center.y).abs().max(1.0);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Compute the result of this measurement given pixel spacing.
     pub fn compute(&self, pixel_spacing: (f64, f64)) -> MeasurementResult {
         let value = match &self.kind {
