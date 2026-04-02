@@ -75,10 +75,10 @@ This is an 8-crate Rust workspace with a thin Slint UI layer and most runtime or
 
 The GUI is split between `ui/windows/study-browser.slint` and `ui/windows/study-viewer.slint`, with shared styling in `ui/theme/theme.slint` and small reusable components in `ui/components/`.
 
-Two sibling repositories are part of the effective architecture, not optional extras:
+Two published crate families are part of the effective architecture, not optional extras:
 
-- `../dicom-toolkit-rs` provides the DICOM parser/image/network crates used throughout the workspace.
-- `../volren-rs` provides the `volren-core` and `volren-gpu` path dependencies.
+- `dicom-toolkit-rs` provides the DICOM parser/image/network crates used throughout the workspace.
+- `volren-rs` provides the `volren-core` and `volren-gpu` dependencies.
 
 The main local viewer flow is:
 
@@ -92,5 +92,4 @@ The main local viewer flow is:
 8. Push the image and interaction state into `StudyViewerWindow`.
 
 Remote browsing/opening is also orchestrated in `leaf-app`: browser search merges local results with DICOMweb results when network mode is enabled, and remote study rows are encoded as `remote:<node_name>:<study_uid>`.
-
 

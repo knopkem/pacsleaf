@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
@@ -22,23 +22,23 @@ categories = ["science", "visualization", "gui"]
 
 [workspace.dependencies]
 # Internal crates
-leaf-core = { path = "crates/leaf-core", version = "0.1.0" }
-leaf-db = { path = "crates/leaf-db", version = "0.1.0" }
-leaf-dicom = { path = "crates/leaf-dicom", version = "0.1.0" }
-leaf-net = { path = "crates/leaf-net", version = "0.1.0" }
-leaf-render = { path = "crates/leaf-render", version = "0.1.0" }
-leaf-tools = { path = "crates/leaf-tools", version = "0.1.0" }
-leaf-ui = { path = "crates/leaf-ui", version = "0.1.0" }
+leaf-core = { path = "crates/leaf-core", version = "0.1.1" }
+leaf-db = { path = "crates/leaf-db", version = "0.1.1" }
+leaf-dicom = { path = "crates/leaf-dicom", version = "0.1.1" }
+leaf-net = { path = "crates/leaf-net", version = "0.1.1" }
+leaf-render = { path = "crates/leaf-render", version = "0.1.1" }
+leaf-tools = { path = "crates/leaf-tools", version = "0.1.1" }
+leaf-ui = { path = "crates/leaf-ui", version = "0.1.1" }
 
-# Sibling crates (local path dependencies)
-dicom-toolkit-core = { path = "../dicom-toolkit-rs/crates/dicom-toolkit-core" }
-dicom-toolkit-dict = { path = "../dicom-toolkit-rs/crates/dicom-toolkit-dict" }
-dicom-toolkit-data = { path = "../dicom-toolkit-rs/crates/dicom-toolkit-data" }
-dicom-toolkit-net = { path = "../dicom-toolkit-rs/crates/dicom-toolkit-net" }
-dicom-toolkit-image = { path = "../dicom-toolkit-rs/crates/dicom-toolkit-image" }
-dicom-toolkit-codec = { path = "../dicom-toolkit-rs/crates/dicom-toolkit-codec" }
-volren-core = { path = "../volren-rs/crates/volren-core" }
-volren-gpu = { path = "../volren-rs/crates/volren-gpu" }
+# Published imaging/network crates
+dicom-toolkit-core = "0.5.0"
+dicom-toolkit-dict = "0.5.0"
+dicom-toolkit-data = "0.5.0"
+dicom-toolkit-net = "0.5.0"
+dicom-toolkit-image = "0.5.0"
+dicom-toolkit-codec = "0.5.0"
+volren-core = "0.1.0"
+volren-gpu = "0.1.0"
 
 # GUI
 slint = { version = "1.12", features = ["unstable-wgpu-24"] }

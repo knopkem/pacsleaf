@@ -25,8 +25,8 @@ RUST_LOG=debug cargo run -p leaf-app
 
 ## Dependencies
 
-- [dicom-toolkit-rs](../dicom-toolkit-rs/) — DICOM parsing, DIMSE networking, image codecs
-- [volren-rs](../volren-rs/) — GPU-accelerated volume rendering
+- [dicom-toolkit-rs](https://crates.io/search?q=dicom-toolkit) — DICOM parsing, DIMSE networking, image codecs
+- [volren-rs](https://crates.io/search?q=volren) — GPU-accelerated volume rendering
 - [Slint](https://slint.dev/) — Cross-platform GUI framework with wgpu integration
 - [redb](https://github.com/cberner/redb) — Embedded database
 

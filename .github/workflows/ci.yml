@@ -22,14 +22,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: pacsleaf
-      - uses: actions/checkout@v4
-        with:
-          repository: knopkem/dicom-toolkit-rs
-          path: dicom-toolkit-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: knopkem/volren-rs
-          path: volren-rs
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
@@ -53,7 +45,7 @@ jobs:
             pacsleaf -> pacsleaf/target
       - name: Cargo check
         working-directory: pacsleaf
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --locked
 
   test:
     name: Test (${{ matrix.os }})
@@ -66,14 +58,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: pacsleaf
-      - uses: actions/checkout@v4
-        with:
-          repository: knopkem/dicom-toolkit-rs
-          path: dicom-toolkit-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: knopkem/volren-rs
-          path: volren-rs
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -98,7 +82,7 @@ jobs:
             pacsleaf -> pacsleaf/target
       - name: Cargo test
         working-directory: pacsleaf
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --locked
 
   fmt:
     name: Format
@@ -107,14 +91,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: pacsleaf
-      - uses: actions/checkout@v4
-        with:
-          repository: knopkem/dicom-toolkit-rs
-          path: dicom-toolkit-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: knopkem/volren-rs
-          path: volren-rs
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -129,14 +105,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: pacsleaf
-      - uses: actions/checkout@v4
-        with:
-          repository: knopkem/dicom-toolkit-rs
-          path: dicom-toolkit-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: knopkem/volren-rs
-          path: volren-rs
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
@@ -162,4 +130,4 @@ jobs:
             pacsleaf -> pacsleaf/target
       - name: Cargo clippy
         working-directory: pacsleaf
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
