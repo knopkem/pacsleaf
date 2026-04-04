@@ -6,6 +6,7 @@ members = [
     "crates/leaf-dicom",
     "crates/leaf-net",
     "crates/leaf-render",
+    "crates/leaf-viewer",
     "crates/leaf-tools",
     "crates/leaf-ui",
     "crates/leaf-app",
@@ -14,7 +15,7 @@ members = [
 [workspace.package]
 version = "0.1.1"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/knopkem/pacsleaf"
 keywords = ["dicom", "medical-imaging", "pacs", "radiology", "viewer"]
@@ -27,6 +28,7 @@ leaf-db = { path = "crates/leaf-db", version = "0.1.1" }
 leaf-dicom = { path = "crates/leaf-dicom", version = "0.1.1" }
 leaf-net = { path = "crates/leaf-net", version = "0.1.1" }
 leaf-render = { path = "crates/leaf-render", version = "0.1.1" }
+leaf-viewer = { path = "crates/leaf-viewer", version = "0.1.1" }
 leaf-tools = { path = "crates/leaf-tools", version = "0.1.1" }
 leaf-ui = { path = "crates/leaf-ui", version = "0.1.1" }
 
@@ -37,8 +39,8 @@ dicom-toolkit-data = "0.5.0"
 dicom-toolkit-net = "0.5.0"
 dicom-toolkit-image = "0.5.0"
 dicom-toolkit-codec = "0.5.0"
-volren-core = "0.1.0"
-volren-gpu = "0.1.0"
+volren-core = { path = "../volren-rs/crates/volren-core" }
+volren-gpu = { path = "../volren-rs/crates/volren-gpu" }
 
 # GUI
 slint = { version = "1.12", features = ["unstable-wgpu-24"] }
@@ -84,6 +86,8 @@ lru = "0.16.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rfd = "0.15"
 pollster = "0.4"
+ustreamer-proto = "0.1.0"
+ustreamer-transport = "0.1.0"
 
 [profile.dev]
 opt-level = 1

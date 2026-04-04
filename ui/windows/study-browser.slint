@@ -3,6 +3,8 @@
 
 import { Theme } from "../theme/theme.slint";
 import { StatusBar } from "../components/status-bar.slint";
+import { ProgressDialog } from "../components/progress-dialog.slint";
+import { TextEntryDialog } from "../components/text-entry-dialog.slint";
 import { ToolbarButton } from "../components/toolbar-button.slint";
 
 // Model for a study row in the browser.
@@ -35,10 +37,19 @@ export component StudyBrowserWindow inherits Window {
     in-out property <string> remote-ae-title: "";
     in-out property <string> dicomweb-url: "";
     in-out property <string> auth-token: "";
+    in property <bool> loading-visible: false;
+    in property <string> loading-title: "";
+    in property <string> loading-message: "";
+    in property <int> loading-current: 0;
+    in property <int> loading-total: 0;
+    in-out property <bool> import-path-dialog-visible: false;
+    in-out property <string> import-path-value: "";
 
     callback search(string, string, string);
     callback open-study(string);
     callback import-files();
+    callback confirm-import-path(string);
+    callback cancel-import-path();
     callback activate-local();
     callback activate-network();
     callback toggle-settings();
@@ -138,14 +149,15 @@ export component StudyBrowserWindow inherits Window {
         HorizontalLayout {
             // Left: Search filters
             Rectangle {
-                width: 220px;
+                width: 180px;
                 background: Theme.surface;
                 border-width: 1px;
                 border-color: Theme.border;
 
                 VerticalLayout {
                     padding: Theme.spacing-lg;
-                    spacing: Theme.spacing-md;
+                    spacing: Theme.spacing-sm;
+                    alignment: start;
 
                     Text {
                         text: "Search";
@@ -155,80 +167,82 @@ export component StudyBrowserWindow inherits Window {
                     }
 
                     // Patient Name
-                    VerticalLayout {
-                        spacing: Theme.spacing-xs;
-                        Text {
-                            text: "Patient Name";
-                            color: Theme.text-secondary;
-                            font-size: Theme.font-xs;
+                    Rectangle {
+                        height: 32px;
+                        border-radius: Theme.radius-sm;
+                        background: Theme.surface-elevated;
+                        border-width: 1px;
+                        border-color: patient-name-input.has-focus ? Theme.accent-primary : Theme.border;
+
+                        patient-name-input := TextInput {
+                            color: Theme.text-primary;
+                            font-size: Theme.font-sm;
+                            horizontal-alignment: left;
+                            vertical-alignment: center;
                         }
-                        Rectangle {
-                            height: 30px;
-                            border-radius: Theme.radius-sm;
-                            background: Theme.surface-elevated;
-                            border-width: 1px;
-                            border-color: Theme.border;
-                            patient-name-input := TextInput {
-                                color: Theme.text-primary;
-                                font-size: Theme.font-sm;
-                                horizontal-alignment: left;
-                                vertical-alignment: center;
-                            }
+                        if patient-name-input.text == "" && !patient-name-input.has-focus: Text {
+                            text: "Patient Name";
+                            color: Theme.text-muted;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                            horizontal-alignment: left;
                         }
                     }
 
                     // Patient ID
-                    VerticalLayout {
-                        spacing: Theme.spacing-xs;
-                        Text {
-                            text: "Patient ID";
-                            color: Theme.text-secondary;
-                            font-size: Theme.font-xs;
+                    Rectangle {
+                        height: 32px;
+                        border-radius: Theme.radius-sm;
+                        background: Theme.surface-elevated;
+                        border-width: 1px;
+                        border-color: patient-id-input.has-focus ? Theme.accent-primary : Theme.border;
+
+                        patient-id-input := TextInput {
+                            color: Theme.text-primary;
+                            font-size: Theme.font-sm;
+                            horizontal-alignment: left;
+                            vertical-alignment: center;
                         }
-                        Rectangle {
-                            height: 30px;
-                            border-radius: Theme.radius-sm;
-                            background: Theme.surface-elevated;
-                            border-width: 1px;
-                            border-color: Theme.border;
-                            patient-id-input := TextInput {
-                                color: Theme.text-primary;
-                                font-size: Theme.font-sm;
-                                horizontal-alignment: left;
-                                vertical-alignment: center;
-                            }
+                        if patient-id-input.text == "" && !patient-id-input.has-focus: Text {
+                            text: "Patient ID";
+                            color: Theme.text-muted;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                            horizontal-alignment: left;
                         }
                     }
 
                     // Accession Number
-                    VerticalLayout {
-                        spacing: Theme.spacing-xs;
-                        Text {
-                            text: "Accession #";
-                            color: Theme.text-secondary;
-                            font-size: Theme.font-xs;
+                    Rectangle {
+                        height: 32px;
+                        border-radius: Theme.radius-sm;
+                        background: Theme.surface-elevated;
+                        border-width: 1px;
+                        border-color: accession-input.has-focus ? Theme.accent-primary : Theme.border;
+
+                        accession-input := TextInput {
+                            color: Theme.text-primary;
+                            font-size: Theme.font-sm;
+                            horizontal-alignment: left;
+                            vertical-alignment: center;
                         }
-                        Rectangle {
-                            height: 30px;
-                            border-radius: Theme.radius-sm;
-                            background: Theme.surface-elevated;
-                            border-width: 1px;
-                            border-color: Theme.border;
-                            accession-input := TextInput {
-                                color: Theme.text-primary;
-                                font-size: Theme.font-sm;
-                                horizontal-alignment: left;
-                                vertical-alignment: center;
-                            }
+                        if accession-input.text == "" && !accession-input.has-focus: Text {
+                            text: "Accession #";
+                            color: Theme.text-muted;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                            horizontal-alignment: left;
                         }
                     }
 
                     // Search button
                     Rectangle {
-                        height: 36px;
+                        height: 32px;
                         border-radius: Theme.radius-md;
-                        background: Theme.accent-primary;
-                        TouchArea {
+                        background: search-touch.has-hover ? Theme.accent-hover : Theme.accent-primary;
+
+                        search-touch := TouchArea {
+                            mouse-cursor: pointer;
                             clicked => {
                                 root.search(
                                     patient-name-input.text,
@@ -248,7 +262,7 @@ export component StudyBrowserWindow inherits Window {
                     }
 
                     if !root.network-mode: Rectangle {
-                        height: 36px;
+                        height: 32px;
                         border-radius: Theme.radius-md;
                         background: import-touch.has-hover ? #ffffff10 : Theme.surface-elevated;
                         border-width: 1px;
@@ -260,7 +274,7 @@ export component StudyBrowserWindow inherits Window {
                         }
 
                         Text {
-                            text: "Import Folder...";
+                            text: "Import Folder…";
                             color: Theme.accent-primary;
                             font-size: Theme.font-sm;
                             font-weight: 600;
@@ -334,185 +348,228 @@ export component StudyBrowserWindow inherits Window {
             }
 
             if settings-visible: Rectangle {
-                width: 300px;
+                width: 280px;
                 background: Theme.surface;
                 border-width: 1px;
                 border-color: Theme.border;
 
-                VerticalLayout {
-                    padding: Theme.spacing-lg;
-                    spacing: Theme.spacing-md;
+                Flickable {
+                    viewport-height: 620px;
 
-                    Text {
-                        text: "Network";
-                        color: Theme.text-primary;
-                        font-size: Theme.font-lg;
-                        font-weight: 600;
-                    }
+                    VerticalLayout {
+                        width: parent.width;
+                        padding: Theme.spacing-lg;
+                        spacing: Theme.spacing-sm;
+                        alignment: start;
 
-                    Text {
-                        text: "PACS node name";
-                        color: Theme.text-secondary;
-                        font-size: Theme.font-xs;
-                    }
-                    Rectangle {
-                        height: 34px;
-                        border-radius: Theme.radius-sm;
-                        background: Theme.surface-elevated;
-                        border-width: 1px;
-                        border-color: Theme.border;
-                        node-name-input := TextInput {
-                            text <=> root.node-name;
+                        Text {
+                            text: "Network";
                             color: Theme.text-primary;
-                            font-size: Theme.font-sm;
-                            vertical-alignment: center;
+                            font-size: Theme.font-lg;
+                            font-weight: 600;
                         }
-                    }
 
-                    Text {
-                        text: "DIMSE";
-                        color: Theme.text-primary;
-                        font-size: Theme.font-sm;
-                        font-weight: 600;
-                    }
+                        // PACS node name
+                        Rectangle {
+                            height: 32px;
+                            border-radius: Theme.radius-sm;
+                            background: Theme.surface-elevated;
+                            border-width: 1px;
+                            border-color: node-name-input.has-focus ? Theme.accent-primary : Theme.border;
 
-                    Text {
-                        text: "Local AE title";
-                        color: Theme.text-secondary;
-                        font-size: Theme.font-xs;
-                    }
-                    Rectangle {
-                        height: 34px;
-                        border-radius: Theme.radius-sm;
-                        background: Theme.surface-elevated;
-                        border-width: 1px;
-                        border-color: Theme.border;
-                        local-ae-title-input := TextInput {
-                            text <=> root.local-ae-title;
-                            color: Theme.text-primary;
-                            font-size: Theme.font-sm;
-                            vertical-alignment: center;
+                            node-name-input := TextInput {
+                                text <=> root.node-name;
+                                color: Theme.text-primary;
+                                font-size: Theme.font-sm;
+                                vertical-alignment: center;
+                            }
+                            if node-name-input.text == "" && !node-name-input.has-focus: Text {
+                                text: "PACS node name";
+                                color: Theme.text-muted;
+                                font-size: Theme.font-sm;
+                                vertical-alignment: center;
+                            }
                         }
-                    }
 
-                    Text {
-                        text: "Remote host";
-                        color: Theme.text-secondary;
-                        font-size: Theme.font-xs;
-                    }
-                    Rectangle {
-                        height: 34px;
-                        border-radius: Theme.radius-sm;
-                        background: Theme.surface-elevated;
-                        border-width: 1px;
-                        border-color: Theme.border;
-                        dimse-host-input := TextInput {
-                            text <=> root.dimse-host;
-                            color: Theme.text-primary;
-                            font-size: Theme.font-sm;
-                            vertical-alignment: center;
+                        // DIMSE section header
+                        Rectangle {
+                            height: 20px;
+                            Text {
+                                text: "DIMSE";
+                                color: Theme.text-secondary;
+                                font-size: Theme.font-xs;
+                                font-weight: 600;
+                                vertical-alignment: bottom;
+                            }
                         }
-                    }
 
-                    Text {
-                        text: "Remote port";
-                        color: Theme.text-secondary;
-                        font-size: Theme.font-xs;
-                    }
-                    Rectangle {
-                        height: 34px;
-                        border-radius: Theme.radius-sm;
-                        background: Theme.surface-elevated;
-                        border-width: 1px;
-                        border-color: Theme.border;
-                        dimse-port-input := TextInput {
-                            text <=> root.dimse-port;
-                            color: Theme.text-primary;
-                            font-size: Theme.font-sm;
-                            vertical-alignment: center;
+                        Rectangle {
+                            height: 32px;
+                            border-radius: Theme.radius-sm;
+                            background: Theme.surface-elevated;
+                            border-width: 1px;
+                            border-color: local-ae-title-input.has-focus ? Theme.accent-primary : Theme.border;
+
+                            local-ae-title-input := TextInput {
+                                text <=> root.local-ae-title;
+                                color: Theme.text-primary;
+                                font-size: Theme.font-sm;
+                                vertical-alignment: center;
+                            }
+                            if local-ae-title-input.text == "" && !local-ae-title-input.has-focus: Text {
+                                text: "Local AE title";
+                                color: Theme.text-muted;
+                                font-size: Theme.font-sm;
+                                vertical-alignment: center;
+                            }
                         }
-                    }
 
-                    Text {
-                        text: "Remote AE title";
-                        color: Theme.text-secondary;
-                        font-size: Theme.font-xs;
-                    }
-                    Rectangle {
-                        height: 34px;
-                        border-radius: Theme.radius-sm;
-                        background: Theme.surface-elevated;
-                        border-width: 1px;
-                        border-color: Theme.border;
-                        remote-ae-title-input := TextInput {
-                            text <=> root.remote-ae-title;
-                            color: Theme.text-primary;
-                            font-size: Theme.font-sm;
-                            vertical-alignment: center;
+                        Rectangle {
+                            height: 32px;
+                            border-radius: Theme.radius-sm;
+                            background: Theme.surface-elevated;
+                            border-width: 1px;
+                            border-color: dimse-host-input.has-focus ? Theme.accent-primary : Theme.border;
+
+                            dimse-host-input := TextInput {
+                                text <=> root.dimse-host;
+                                color: Theme.text-primary;
+                                font-size: Theme.font-sm;
+                                vertical-alignment: center;
+                            }
+                            if dimse-host-input.text == "" && !dimse-host-input.has-focus: Text {
+                                text: "Remote host";
+                                color: Theme.text-muted;
+                                font-size: Theme.font-sm;
+                                vertical-alignment: center;
+                            }
                         }
-                    }
 
-                    Text {
-                        text: "DICOMweb";
-                        color: Theme.text-primary;
-                        font-size: Theme.font-sm;
-                        font-weight: 600;
-                    }
+                        Rectangle {
+                            height: 32px;
+                            border-radius: Theme.radius-sm;
+                            background: Theme.surface-elevated;
+                            border-width: 1px;
+                            border-color: dimse-port-input.has-focus ? Theme.accent-primary : Theme.border;
 
-                    Text {
-                        text: "DICOMweb URL";
-                        color: Theme.text-secondary;
-                        font-size: Theme.font-xs;
-                    }
-                    Rectangle {
-                        height: 34px;
-                        border-radius: Theme.radius-sm;
-                        background: Theme.surface-elevated;
-                        border-width: 1px;
-                        border-color: Theme.border;
-                        dicomweb-url-input := TextInput {
-                            text <=> root.dicomweb-url;
-                            color: Theme.text-primary;
-                            font-size: Theme.font-sm;
-                            vertical-alignment: center;
+                            dimse-port-input := TextInput {
+                                text <=> root.dimse-port;
+                                color: Theme.text-primary;
+                                font-size: Theme.font-sm;
+                                vertical-alignment: center;
+                            }
+                            if dimse-port-input.text == "" && !dimse-port-input.has-focus: Text {
+                                text: "Remote port";
+                                color: Theme.text-muted;
+                                font-size: Theme.font-sm;
+                                vertical-alignment: center;
+                            }
                         }
-                    }
 
-                    Text {
-                        text: "Bearer token";
-                        color: Theme.text-secondary;
-                        font-size: Theme.font-xs;
-                    }
-                    Rectangle {
-                        height: 34px;
-                        border-radius: Theme.radius-sm;
-                        background: Theme.surface-elevated;
-                        border-width: 1px;
-                        border-color: Theme.border;
-                        auth-token-input := TextInput {
-                            text <=> root.auth-token;
-                            color: Theme.text-primary;
-                            font-size: Theme.font-sm;
-                            vertical-alignment: center;
+                        Rectangle {
+                            height: 32px;
+                            border-radius: Theme.radius-sm;
+                            background: Theme.surface-elevated;
+                            border-width: 1px;
+                            border-color: remote-ae-title-input.has-focus ? Theme.accent-primary : Theme.border;
+
+                            remote-ae-title-input := TextInput {
+                                text <=> root.remote-ae-title;
+                                color: Theme.text-primary;
+                                font-size: Theme.font-sm;
+                                vertical-alignment: center;
+                            }
+                            if remote-ae-title-input.text == "" && !remote-ae-title-input.has-focus: Text {
+                                text: "Remote AE title";
+                                color: Theme.text-muted;
+                                font-size: Theme.font-sm;
+                                vertical-alignment: center;
+                            }
                         }
-                    }
 
-                    Rectangle { }
+                        // DICOMweb section header
+                        Rectangle {
+                            height: 20px;
+                            Text {
+                                text: "DICOMweb";
+                                color: Theme.text-secondary;
+                                font-size: Theme.font-xs;
+                                font-weight: 600;
+                                vertical-alignment: bottom;
+                            }
+                        }
 
-                    ToolbarButton {
-                        width: 84px;
-                        label: "Save";
-                        active: true;
-                        clicked => {
-                            root.save-settings(
-                                node-name-input.text,
-                                local-ae-title-input.text,
-                                dimse-host-input.text,
-                                dimse-port-input.text,
-                                remote-ae-title-input.text,
-                                dicomweb-url-input.text,
-                                auth-token-input.text,
-                            );
+                        Rectangle {
+                            height: 32px;
+                            border-radius: Theme.radius-sm;
+                            background: Theme.surface-elevated;
+                            border-width: 1px;
+                            border-color: dicomweb-url-input.has-focus ? Theme.accent-primary : Theme.border;
+
+                            dicomweb-url-input := TextInput {
+                                text <=> root.dicomweb-url;
+                                color: Theme.text-primary;
+                                font-size: Theme.font-sm;
+                                vertical-alignment: center;
+                            }
+                            if dicomweb-url-input.text == "" && !dicomweb-url-input.has-focus: Text {
+                                text: "DICOMweb URL";
+                                color: Theme.text-muted;
+                                font-size: Theme.font-sm;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        Rectangle {
+                            height: 32px;
+                            border-radius: Theme.radius-sm;
+                            background: Theme.surface-elevated;
+                            border-width: 1px;
+                            border-color: auth-token-input.has-focus ? Theme.accent-primary : Theme.border;
+
+                            auth-token-input := TextInput {
+                                text <=> root.auth-token;
+                                color: Theme.text-primary;
+                                font-size: Theme.font-sm;
+                                vertical-alignment: center;
+                            }
+                            if auth-token-input.text == "" && !auth-token-input.has-focus: Text {
+                                text: "Bearer token";
+                                color: Theme.text-muted;
+                                font-size: Theme.font-sm;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        // Save button
+                        Rectangle {
+                            height: 32px;
+                            border-radius: Theme.radius-md;
+                            background: save-touch.has-hover ? Theme.accent-hover : Theme.accent-primary;
+                            width: 80px;
+
+                            save-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.save-settings(
+                                        node-name-input.text,
+                                        local-ae-title-input.text,
+                                        dimse-host-input.text,
+                                        dimse-port-input.text,
+                                        remote-ae-title-input.text,
+                                        dicomweb-url-input.text,
+                                        auth-token-input.text,
+                                    );
+                                }
+                            }
+                            Text {
+                                text: "Save";
+                                color: Theme.text-primary;
+                                font-size: Theme.font-sm;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
                         }
                     }
                 }
@@ -524,5 +581,22 @@ export component StudyBrowserWindow inherits Window {
             connection-status: root.connection-status;
             study-info: studies.length == 0 ? "No studies" : studies.length == 1 ? "1 study" : "\{studies.length} studies";
         }
+    }
+
+    ProgressDialog {
+        visible: root.loading-visible;
+        title: root.loading-title;
+        message: root.loading-message;
+        progress-current: root.loading-current;
+        progress-total: root.loading-total;
+    }
+
+    if root.import-path-dialog-visible: TextEntryDialog {
+        title: "Import folder";
+        message: "Enter a folder path on the pacsleaf host machine.";
+        value <=> root.import-path-value;
+        confirm-label: "Import";
+        cancelled => { root.cancel-import-path(); }
+        confirmed(path) => { root.confirm-import-path(path); }
     }
 }

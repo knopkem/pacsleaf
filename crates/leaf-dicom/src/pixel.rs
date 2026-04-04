@@ -1,10 +1,12 @@
 //! Pixel data extraction and decoding from DICOM files.
 
+use dicom_toolkit_data::value::{PixelData, Value};
 use dicom_toolkit_data::FileFormat;
-use dicom_toolkit_dict::tags;
+use dicom_toolkit_dict::{tags, Vr};
 use dicom_toolkit_image::{pixel, DicomImage, ModalityLut, PixelRepresentation};
 use leaf_core::error::{LeafError, LeafResult};
 use std::path::Path;
+use tracing::debug;
 
 /// Decoded image frame as pixel data.
 pub struct DecodedFrame {
@@ -37,7 +39,8 @@ pub fn decode_frame_with_window(
     frame_index: u32,
     window_override: Option<(f64, f64)>,
 ) -> LeafResult<DecodedFrame> {
-    let file = FileFormat::open(path).map_err(|e| LeafError::DicomParse(e.to_string()))?;
+    let mut file = FileFormat::open(path).map_err(|e| LeafError::DicomParse(e.to_string()))?;
+    decompress_pixel_data(&mut file)?;
     let mut image = DicomImage::from_dataset(&file.dataset)
         .map_err(|e| LeafError::DicomParse(e.to_string()))?;
 
@@ -68,7 +71,8 @@ pub fn decode_frame_for_measurements(
     path: &Path,
     frame_index: u32,
 ) -> LeafResult<MeasurementFrame> {
-    let file = FileFormat::open(path).map_err(|e| LeafError::DicomParse(e.to_string()))?;
+    let mut file = FileFormat::open(path).map_err(|e| LeafError::DicomParse(e.to_string()))?;
+    decompress_pixel_data(&mut file)?;
     let ds = &file.dataset;
     let image = DicomImage::from_dataset(ds).map_err(|e| LeafError::DicomParse(e.to_string()))?;
 
@@ -141,4 +145,55 @@ pub fn frame_count(path: &Path) -> LeafResult<usize> {
         .and_then(|s| s.trim().parse::<usize>().ok())
         .unwrap_or(1);
     Ok(count)
+}
+
+/// Decompress encapsulated (compressed) pixel data in-place so that
+/// `DicomImage::from_dataset()` receives native pixel bytes.
+fn decompress_pixel_data(file: &mut FileFormat) -> LeafResult<()> {
+    let ts_uid = file.meta.transfer_syntax_uid.clone();
+
+    // Extract compressed fragments and image dimensions in a scoped borrow.
+    let compressed = {
+        let ds = &file.dataset;
+        let Some(elem) = ds.get(tags::PIXEL_DATA) else {
+            return Ok(());
+        };
+        let Value::PixelData(PixelData::Encapsulated { fragments, .. }) = &elem.value else {
+            return Ok(());
+        };
+        Some((
+            fragments.clone(),
+            ds.get_u16(tags::ROWS).unwrap_or(0),
+            ds.get_u16(tags::COLUMNS).unwrap_or(0),
+            ds.get_u16(tags::BITS_ALLOCATED).unwrap_or(16),
+            ds.get_u16(tags::SAMPLES_PER_PIXEL).unwrap_or(1),
+        ))
+    };
+
+    let Some((fragments, rows, cols, bits, samples)) = compressed else {
+        return Ok(());
+    };
+
+    let mut all_pixels = Vec::new();
+    for fragment in &fragments {
+        let decoded = dicom_toolkit_codec::decode_pixel_data(
+            &ts_uid, fragment, rows, cols, bits, samples,
+        )
+        .map_err(|e| {
+            LeafError::DicomParse(format!(
+                "codec decompression failed (TS {ts_uid}): {e}"
+            ))
+        })?;
+        all_pixels.extend_from_slice(&decoded);
+    }
+
+    debug!(
+        "Decoded {} encapsulated fragment(s) via codec (TS {})",
+        fragments.len(),
+        ts_uid
+    );
+
+    let vr = if bits > 8 { Vr::OW } else { Vr::OB };
+    file.dataset.set_bytes(tags::PIXEL_DATA, vr, all_pixels);
+    Ok(())
 }

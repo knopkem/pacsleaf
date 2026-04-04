@@ -13,6 +13,7 @@ fn db_err(e: impl std::fmt::Display) -> LeafError {
 }
 
 /// The local imagebox database, managing DICOM studies on disk.
+#[derive(Clone)]
 pub struct Imagebox {
     db: Arc<Database>,
 }

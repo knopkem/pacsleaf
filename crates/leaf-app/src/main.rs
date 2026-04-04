@@ -23,11 +23,13 @@ use leaf_dicom::metadata::import_dicom_file;
 use leaf_dicom::pixel::decode_frame;
 use leaf_net::dicomweb::DicomWebClient;
 use rfd::FileDialog;
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::time::Duration;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use viewer::{install_viewer_tool_state, open_viewer_for_study};
@@ -78,6 +80,15 @@ fn main() -> Result<()> {
         apply_window_geometry(browser.window(), geometry);
     }
     apply_browser_settings(&browser, &settings_state.borrow());
+    browser.set_import_path_dialog_visible(false);
+    browser.set_import_path_value(
+        settings_state
+            .borrow()
+            .initial_import_directory()
+            .display()
+            .to_string()
+            .into(),
+    );
     browser.set_connection_status("Local imagebox".into());
     refresh_browser(
         &browser,
@@ -90,6 +101,7 @@ fn main() -> Result<()> {
 
     let open_windows: Rc<RefCell<Vec<leaf_ui::StudyViewerWindow>>> =
         Rc::new(RefCell::new(Vec::new()));
+    let import_timer: Rc<RefCell<Option<Timer>>> = Rc::new(RefCell::new(None));
 
     let imagebox_for_browser_close = imagebox.clone();
     let browser_weak_for_close = browser.as_weak();
@@ -160,7 +172,12 @@ fn main() -> Result<()> {
     let imagebox_for_import = imagebox.clone();
     let settings_for_import = settings_state.clone();
     let runtime_for_import = runtime.clone();
+    let import_timer_for_import = import_timer.clone();
     browser.on_import_files(move || {
+        let Some(browser) = browser_for_import.upgrade() else {
+            return;
+        };
+
         let initial_directory = settings_for_import.borrow().initial_import_directory();
         let mut dialog = FileDialog::new();
         if initial_directory.exists() {
@@ -173,46 +190,51 @@ fn main() -> Result<()> {
             }
             return;
         };
+        begin_import_from_path(
+            &browser,
+            &imagebox_for_import,
+            &settings_for_import,
+            &runtime_for_import,
+            &import_timer_for_import,
+            import_path,
+        );
+    });
 
-        info!("Import files requested from {}", import_path.display());
+    let browser_for_import_confirm = browser.as_weak();
+    let imagebox_for_import_confirm = imagebox.clone();
+    let settings_for_import_confirm = settings_state.clone();
+    let runtime_for_import_confirm = runtime.clone();
+    let import_timer_for_import_confirm = import_timer.clone();
+    browser.on_confirm_import_path(move |path| {
+        let Some(browser) = browser_for_import_confirm.upgrade() else {
+            return;
+        };
+        let import_path = PathBuf::from(path.trim());
+        if path.trim().is_empty() {
+            browser.set_connection_status("Import path cannot be empty".into());
+            return;
+        }
+        if !import_path.exists() {
+            browser.set_connection_status(
+                format!("Import path does not exist: {}", import_path.display()).into(),
+            );
+            return;
+        }
+        begin_import_from_path(
+            &browser,
+            &imagebox_for_import_confirm,
+            &settings_for_import_confirm,
+            &runtime_for_import_confirm,
+            &import_timer_for_import_confirm,
+            import_path,
+        );
+    });
 
-        let result = (|| -> LeafResult<()> {
-            let mut new_settings = settings_for_import.borrow().clone();
-            new_settings.last_import_path = Some(import_path.display().to_string());
-            save_browser_settings(&imagebox_for_import, &new_settings)?;
-            *settings_for_import.borrow_mut() = new_settings.clone();
-
-            import_from_path(&imagebox_for_import, import_path.as_ref()).and_then(|summary| {
-                if let Some(browser) = browser_for_import.upgrade() {
-                    let nodes = new_settings.pacs_nodes();
-                    refresh_browser(
-                        &browser,
-                        &imagebox_for_import,
-                        &nodes,
-                        browser.get_network_mode(),
-                        &runtime_for_import,
-                        BrowserQuery::default(),
-                    )?;
-                    let status = if summary.file_count == 0 {
-                        format!("No DICOM files found in {}", import_path.display())
-                    } else {
-                        format!(
-                            "Imported {} files from {} into {} studies",
-                            summary.file_count,
-                            import_path.display(),
-                            summary.study_count
-                        )
-                    };
-                    browser.set_connection_status(status.into());
-                }
-                Ok(())
-            })
-        })();
-        if let Err(error) = result {
-            if let Some(browser) = browser_for_import.upgrade() {
-                browser.set_connection_status(format!("Import failed: {error}").into());
-            }
-            info!("Import failed: {}", error);
+    let browser_for_import_cancel = browser.as_weak();
+    browser.on_cancel_import_path(move || {
+        if let Some(browser) = browser_for_import_cancel.upgrade() {
+            browser.set_import_path_dialog_visible(false);
+            browser.set_connection_status("Import cancelled".into());
         }
     });
 
@@ -283,9 +305,10 @@ fn main() -> Result<()> {
                         LeafError::Config("DIMSE port must be a valid number".into())
                     })?
                 };
+                let current_settings = settings_for_save.borrow().clone();
 
                 let new_settings = BrowserSettings {
-                    last_import_path: settings_for_save.borrow().last_import_path.clone(),
+                    last_import_path: current_settings.last_import_path.clone(),
                     node_name: node_name.trim().to_string(),
                     local_ae_title: if local_ae_title.trim().is_empty() {
                         default_local_ae_title()
@@ -300,9 +323,9 @@ fn main() -> Result<()> {
                 };
 
                 validate_browser_settings(&new_settings)?;
-                save_browser_settings(&imagebox_for_save_settings, &new_settings)?;
-                *settings_for_save.borrow_mut() = new_settings.clone();
                 if let Some(browser) = browser_for_save_settings.upgrade() {
+                    save_browser_settings(&imagebox_for_save_settings, &new_settings)?;
+                    *settings_for_save.borrow_mut() = new_settings.clone();
                     apply_browser_settings(&browser, &new_settings);
                     browser.set_settings_visible(false);
                     let nodes = new_settings.pacs_nodes();
@@ -315,6 +338,9 @@ fn main() -> Result<()> {
                         BrowserQuery::default(),
                     )?;
                     browser.set_connection_status("Settings saved".into());
+                } else {
+                    save_browser_settings(&imagebox_for_save_settings, &new_settings)?;
+                    *settings_for_save.borrow_mut() = new_settings;
                 }
                 Ok(())
             })();
@@ -352,14 +378,221 @@ struct ImportSummary {
     study_count: usize,
 }
 
+struct ImportProgressUpdate {
+    title: String,
+    message: String,
+    current: usize,
+    total: usize,
+}
+
+enum ImportWorkerEvent {
+    Progress(ImportProgressUpdate),
+    Finished {
+        path_display: String,
+        result: Result<ImportSummary, String>,
+    },
+}
+
+fn set_browser_loading_state(
+    browser: &leaf_ui::StudyBrowserWindow,
+    visible: bool,
+    title: &str,
+    message: &str,
+    current: usize,
+    total: usize,
+) {
+    browser.set_loading_visible(visible);
+    browser.set_loading_title(title.into());
+    browser.set_loading_message(message.into());
+    browser.set_loading_current(current.min(i32::MAX as usize) as i32);
+    browser.set_loading_total(total.min(i32::MAX as usize) as i32);
+}
+
+fn begin_import_from_path(
+    browser: &leaf_ui::StudyBrowserWindow,
+    imagebox: &Rc<Imagebox>,
+    settings_state: &Rc<RefCell<BrowserSettings>>,
+    runtime: &Rc<tokio::runtime::Runtime>,
+    import_timer: &Rc<RefCell<Option<Timer>>>,
+    import_path: PathBuf,
+) {
+    browser.set_import_path_dialog_visible(false);
+    browser.set_import_path_value(import_path.display().to_string().into());
+    info!("Import files requested from {}", import_path.display());
+
+    let new_settings = match (|| -> LeafResult<BrowserSettings> {
+        let mut new_settings = settings_state.borrow().clone();
+        new_settings.last_import_path = Some(import_path.display().to_string());
+        save_browser_settings(imagebox, &new_settings)?;
+        *settings_state.borrow_mut() = new_settings.clone();
+        Ok(new_settings)
+    })() {
+        Ok(new_settings) => new_settings,
+        Err(error) => {
+            browser.set_connection_status(format!("Import failed: {error}").into());
+            info!("Import failed: {}", error);
+            return;
+        }
+    };
+
+    set_browser_loading_state(
+        browser,
+        true,
+        "Importing data",
+        "Scanning selected folder...",
+        0,
+        0,
+    );
+    browser.set_connection_status("Importing files...".into());
+
+    if let Some(timer) = import_timer.borrow_mut().take() {
+        timer.stop();
+    }
+
+    let background_imagebox = imagebox.as_ref().clone();
+    let import_path_for_worker = import_path.clone();
+    let path_display = import_path.display().to_string();
+    let (sender, receiver) = mpsc::channel::<ImportWorkerEvent>();
+    std::thread::spawn(move || {
+        let progress_sender = sender.clone();
+        let result = import_from_path_with_progress(
+            &background_imagebox,
+            import_path_for_worker.as_ref(),
+            move |update| {
+                let _ = progress_sender.send(ImportWorkerEvent::Progress(update));
+            },
+        );
+        let _ = sender.send(ImportWorkerEvent::Finished {
+            path_display,
+            result: result.map_err(|error| error.to_string()),
+        });
+    });
+
+    let browser_for_import_timer = browser.as_weak();
+    let imagebox_for_import_timer = imagebox.clone();
+    let runtime_for_import_timer = runtime.clone();
+    let import_timer_slot = import_timer.clone();
+    let new_settings_for_timer = new_settings.clone();
+    let timer = Timer::default();
+    timer.start(TimerMode::Repeated, Duration::from_millis(33), move || {
+        loop {
+            match receiver.try_recv() {
+                Ok(ImportWorkerEvent::Progress(update)) => {
+                    if let Some(browser) = browser_for_import_timer.upgrade() {
+                        set_browser_loading_state(
+                            &browser,
+                            true,
+                            &update.title,
+                            &update.message,
+                            update.current,
+                            update.total,
+                        );
+                    }
+                }
+                Ok(ImportWorkerEvent::Finished {
+                    path_display,
+                    result,
+                }) => {
+                    if let Some(timer) = import_timer_slot.borrow().as_ref() {
+                        timer.stop();
+                    }
+                    *import_timer_slot.borrow_mut() = None;
+
+                    if let Some(browser) = browser_for_import_timer.upgrade() {
+                        set_browser_loading_state(&browser, false, "", "", 0, 0);
+                        match result {
+                            Ok(summary) => {
+                                let nodes = new_settings_for_timer.pacs_nodes();
+                                if let Err(error) = refresh_browser(
+                                    &browser,
+                                    &imagebox_for_import_timer,
+                                    &nodes,
+                                    browser.get_network_mode(),
+                                    &runtime_for_import_timer,
+                                    BrowserQuery::default(),
+                                ) {
+                                    browser.set_connection_status(
+                                        format!("Import refresh failed: {error}").into(),
+                                    );
+                                    info!("Import refresh failed: {}", error);
+                                } else {
+                                    let status = if summary.file_count == 0 {
+                                        format!("No DICOM files found in {}", path_display)
+                                    } else {
+                                        format!(
+                                            "Imported {} files from {} into {} studies",
+                                            summary.file_count, path_display, summary.study_count
+                                        )
+                                    };
+                                    browser.set_connection_status(status.into());
+                                }
+                            }
+                            Err(error) => {
+                                browser.set_connection_status(
+                                    format!("Import failed: {error}").into(),
+                                );
+                                info!("Import failed: {}", error);
+                            }
+                        }
+                    }
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if let Some(timer) = import_timer_slot.borrow().as_ref() {
+                        timer.stop();
+                    }
+                    *import_timer_slot.borrow_mut() = None;
+                    if let Some(browser) = browser_for_import_timer.upgrade() {
+                        set_browser_loading_state(&browser, false, "", "", 0, 0);
+                        browser.set_connection_status("Import failed".into());
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    *import_timer.borrow_mut() = Some(timer);
+}
+
 fn import_from_path(imagebox: &Imagebox, path: &Path) -> LeafResult<ImportSummary> {
+    import_from_path_with_progress(imagebox, path, |_| {})
+}
+
+fn import_from_path_with_progress<F>(
+    imagebox: &Imagebox,
+    path: &Path,
+    mut progress: F,
+) -> LeafResult<ImportSummary>
+where
+    F: FnMut(ImportProgressUpdate),
+{
+    progress(ImportProgressUpdate {
+        title: "Importing data".to_string(),
+        message: format!("Scanning {}", path.display()),
+        current: 0,
+        total: 0,
+    });
+
     let mut files = Vec::new();
     collect_files(path, &mut files)?;
 
     let mut accumulator = ImportAccumulator::default();
     let mut imported_files = 0usize;
+    let total_files = files.len();
 
-    for file in files {
+    progress(ImportProgressUpdate {
+        title: "Importing data".to_string(),
+        message: if total_files == 0 {
+            "No files found in the selected folder".to_string()
+        } else {
+            format!("Reading {} files...", total_files)
+        },
+        current: 0,
+        total: total_files,
+    });
+
+    for (index, file) in files.into_iter().enumerate() {
         match import_dicom_file(&file) {
             Ok((study, series, instance)) => {
                 merge_import_item(&mut accumulator, study, series, instance);
@@ -373,8 +606,17 @@ fn import_from_path(imagebox: &Imagebox, path: &Path) -> LeafResult<ImportSummar
                 );
             }
         }
+
+        progress(ImportProgressUpdate {
+            title: "Importing data".to_string(),
+            message: format!("Processed {} of {} files", index + 1, total_files),
+            current: index + 1,
+            total: total_files,
+        });
     }
 
+    let total_series = accumulator.series.len();
+    let mut processed_series = 0usize;
     for (study_uid, study) in accumulator.studies.clone() {
         let mut study = study;
         let series_list = accumulator
@@ -413,6 +655,12 @@ fn import_from_path(imagebox: &Imagebox, path: &Path) -> LeafResult<ImportSummar
             study.modalities = modalities.into_iter().collect();
         }
 
+        progress(ImportProgressUpdate {
+            title: "Importing data".to_string(),
+            message: format!("Saving study {}", study_uid),
+            current: 0,
+            total: 0,
+        });
         imagebox.store_study(&study, &series_list, &instances)?;
 
         // Generate thumbnails for each series from the middle slice
@@ -426,6 +674,16 @@ fn import_from_path(imagebox: &Imagebox, path: &Path) -> LeafResult<ImportSummar
             if let Err(e) = generate_and_store_thumbnail(imagebox, series_uid, &series_instances) {
                 info!("Thumbnail generation failed for {}: {}", series_uid, e);
             }
+            processed_series += 1;
+            progress(ImportProgressUpdate {
+                title: "Importing data".to_string(),
+                message: format!(
+                    "Generating thumbnails ({}/{})",
+                    processed_series, total_series
+                ),
+                current: processed_series,
+                total: total_series,
+            });
         }
     }
 

@@ -1,0 +1,84 @@
+import { Theme } from "../theme/theme.slint";
+import { ToolbarButton } from "./toolbar-button.slint";
+
+export component TextEntryDialog inherits Rectangle {
+    in property <string> title: "Enter value";
+    in property <string> message: "";
+    in-out property <string> value: "";
+    in property <string> confirm-label: "OK";
+    in property <string> cancel-label: "Cancel";
+
+    callback confirmed(string);
+    callback cancelled();
+
+    background: #00000088;
+
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+    }
+
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 420px;
+        height: 196px;
+        border-radius: Theme.radius-lg;
+        background: Theme.surface;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        VerticalLayout {
+            padding: Theme.spacing-xxl;
+            spacing: Theme.spacing-lg;
+
+            Text {
+                text: root.title;
+                color: Theme.text-primary;
+                font-size: Theme.font-xl;
+                font-weight: 600;
+            }
+
+            Text {
+                text: root.message;
+                color: Theme.text-secondary;
+                font-size: Theme.font-sm;
+                wrap: word-wrap;
+            }
+
+            Rectangle {
+                height: 36px;
+                border-radius: Theme.radius-sm;
+                background: Theme.surface-elevated;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                path-input := TextInput {
+                    text <=> root.value;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-sm;
+                    vertical-alignment: center;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: Theme.spacing-sm;
+
+                Rectangle { }
+
+                ToolbarButton {
+                    width: 84px;
+                    label: root.cancel-label;
+                    clicked => { root.cancelled(); }
+                }
+
+                ToolbarButton {
+                    width: 84px;
+                    label: root.confirm-label;
+                    active: true;
+                    clicked => { root.confirmed(path-input.text); }
+                }
+            }
+        }
+    }
+}

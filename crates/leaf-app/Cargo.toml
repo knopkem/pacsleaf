@@ -16,6 +16,7 @@ leaf-db = { workspace = true }
 leaf-dicom = { workspace = true }
 leaf-net = { workspace = true }
 leaf-render = { workspace = true }
+leaf-viewer = { workspace = true }
 leaf-tools = { workspace = true }
 leaf-ui = { workspace = true }
 slint = { workspace = true }

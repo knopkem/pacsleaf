@@ -1,5 +1,6 @@
 //! Volume assembly from a DICOM series for use with volren-rs.
 
+use dicom_toolkit_data::value::{PixelData, Value};
 use dicom_toolkit_data::FileFormat;
 use dicom_toolkit_dict::{tags, Tag};
 use dicom_toolkit_image::{pixel, ModalityLut, PixelRepresentation};
@@ -76,10 +77,8 @@ pub fn assemble_volume(file_paths: &[String], _series_uid: &SeriesUid) -> LeafRe
         let file = FileFormat::open(Path::new(&entry.path))
             .map_err(|e| LeafError::DicomParse(e.to_string()))?;
         let ds = &file.dataset;
-        let pixel_data = ds
-            .get_bytes(tags::PIXEL_DATA)
-            .ok_or_else(|| LeafError::VolumeAssembly("Missing pixel data".into()))?;
-        let slice_voxels = decode_modality_voxels(ds, pixel_data, width * height)?;
+        let pixel_bytes = extract_pixel_bytes(&file)?;
+        let slice_voxels = decode_modality_voxels(ds, &pixel_bytes, width * height)?;
         voxels.extend_from_slice(&slice_voxels);
     }
 
@@ -103,6 +102,48 @@ pub fn assemble_volume(file_paths: &[String], _series_uid: &SeriesUid) -> LeafRe
     .map_err(|e| LeafError::VolumeAssembly(e.to_string()))?;
 
     Ok(volume)
+}
+
+/// Extract raw (uncompressed) pixel bytes from a DICOM file, automatically
+/// decoding encapsulated (compressed) pixel data via `dicom-toolkit-codec`.
+fn extract_pixel_bytes(file: &FileFormat) -> LeafResult<Vec<u8>> {
+    let ds = &file.dataset;
+    let element = ds
+        .get(tags::PIXEL_DATA)
+        .ok_or_else(|| LeafError::VolumeAssembly("Missing pixel data element".into()))?;
+
+    match &element.value {
+        Value::PixelData(PixelData::Native { bytes }) => Ok(bytes.clone()),
+        Value::PixelData(PixelData::Encapsulated { fragments, .. }) => {
+            let ts_uid = &file.meta.transfer_syntax_uid;
+            let rows = ds.get_u16(tags::ROWS).unwrap_or(0);
+            let cols = ds.get_u16(tags::COLUMNS).unwrap_or(0);
+            let bits = ds.get_u16(tags::BITS_ALLOCATED).unwrap_or(16);
+            let samples = ds.get_u16(tags::SAMPLES_PER_PIXEL).unwrap_or(1);
+
+            let mut all_pixels = Vec::new();
+            for fragment in fragments {
+                let decoded = dicom_toolkit_codec::decode_pixel_data(
+                    ts_uid, fragment, rows, cols, bits, samples,
+                )
+                .map_err(|e| {
+                    LeafError::VolumeAssembly(format!(
+                        "codec decompression failed (TS {ts_uid}): {e}"
+                    ))
+                })?;
+                all_pixels.extend_from_slice(&decoded);
+            }
+            debug!(
+                "Decoded {} encapsulated fragment(s) via codec (TS {})",
+                fragments.len(),
+                ts_uid
+            );
+            Ok(all_pixels)
+        }
+        _ => Err(LeafError::VolumeAssembly(
+            "Pixel data element has unexpected value type".into(),
+        )),
+    }
 }
 
 fn extract_position(ds: &dicom_toolkit_data::DataSet) -> Option<DVec3> {

@@ -54,7 +54,7 @@ impl<'a> BrowserQuery<'a> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BrowserSettings {
     #[serde(default)]
     pub(crate) last_import_path: Option<String>,

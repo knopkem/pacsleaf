@@ -2,6 +2,7 @@
 // Multi-viewport DICOM viewer with toolbar, series strip, and measurement panel.
 
 import { Theme } from "../theme/theme.slint";
+import { ProgressDialog } from "../components/progress-dialog.slint";
 import { ToolbarButton } from "../components/toolbar-button.slint";
 import { StatusBar } from "../components/status-bar.slint";
 
@@ -331,6 +332,11 @@ export component StudyViewerWindow inherits Window {
     in property <[QuadReferenceLine]> quad-axial-reference-lines: [];
     in property <[QuadReferenceLine]> quad-coronal-reference-lines: [];
     in property <[QuadReferenceLine]> quad-sagittal-reference-lines: [];
+    in property <bool> loading-visible: false;
+    in property <string> loading-title: "";
+    in property <string> loading-message: "";
+    in property <int> loading-current: 0;
+    in property <int> loading-total: 0;
 
     callback tool-selected(ViewerTool);
     callback series-selected(string);
@@ -1000,5 +1006,13 @@ export component StudyViewerWindow inherits Window {
             study-info: root.study-description;
             image-count: root.slice-info;
         }
+    }
+
+    ProgressDialog {
+        visible: root.loading-visible;
+        title: root.loading-title;
+        message: root.loading-message;
+        progress-current: root.loading-current;
+        progress-total: root.loading-total;
     }
 }

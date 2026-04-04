@@ -1,0 +1,18 @@
+[package]
+name = "leaf-viewer"
+description = "Shared headless viewer engine for pacsleaf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+leaf-core = { workspace = true }
+leaf-db = { workspace = true }
+leaf-dicom = { workspace = true }
+leaf-render = { workspace = true }
+leaf-tools = { workspace = true }
+glam = { workspace = true }
+lru = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

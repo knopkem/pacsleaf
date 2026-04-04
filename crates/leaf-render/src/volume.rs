@@ -1210,18 +1210,21 @@ fn match_luminance(color: RgbColor, target_luminance: f64) -> RgbColor {
 
 fn shading_for_transfer_window(center: f64) -> ShadingParams {
     if center >= 400.0 {
+        // Bone / hard tissue: sharp specular highlights.
         ShadingParams {
-            ambient: 0.10,
-            diffuse: 0.40,
+            ambient: 0.15,
+            diffuse: 0.50,
             specular: 1.05,
             specular_power: 54.0,
         }
     } else {
+        // Soft tissue: brighter ambient prevents dark regions,
+        // moderate specular adds definition (matching mediseen VTK).
         ShadingParams {
-            ambient: 0.28,
-            diffuse: 0.76,
-            specular: 0.10,
-            specular_power: 18.0,
+            ambient: 0.45,
+            diffuse: 0.70,
+            specular: 0.60,
+            specular_power: 17.0,
         }
     }
 }

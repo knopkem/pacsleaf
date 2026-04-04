@@ -1,0 +1,77 @@
+import { Theme } from "../theme/theme.slint";
+
+export component ProgressDialog inherits Rectangle {
+    in property <string> title: "Working";
+    in property <string> message: "";
+    in property <int> progress-current: 0;
+    in property <int> progress-total: 0;
+
+    background: #00000088;
+
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+    }
+
+    property <float> progress-fraction: root.progress-total > 0
+        ? (root.progress-current < 0 ? 0.0 : (root.progress-current > root.progress-total ? 1.0 : (root.progress-current * 1.0) / root.progress-total))
+        : 0.0;
+
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 360px;
+        height: root.progress-total > 0 ? 156px : 128px;
+        border-radius: Theme.radius-lg;
+        background: Theme.surface;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        VerticalLayout {
+            padding: Theme.spacing-xxl;
+            spacing: Theme.spacing-lg;
+
+            Text {
+                text: root.title;
+                color: Theme.text-primary;
+                font-size: Theme.font-xl;
+                font-weight: 600;
+                horizontal-alignment: center;
+            }
+
+            Text {
+                text: root.message;
+                color: Theme.text-secondary;
+                font-size: Theme.font-sm;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+
+            if root.progress-total > 0: VerticalLayout {
+                spacing: Theme.spacing-sm;
+
+                Rectangle {
+                    height: 8px;
+                    border-radius: 4px;
+                    background: Theme.background;
+                    border-width: 1px;
+                    border-color: Theme.border;
+
+                    Rectangle {
+                        width: parent.width * root.progress-fraction;
+                        height: parent.height;
+                        border-radius: parent.border-radius;
+                        background: Theme.accent-primary;
+                    }
+                }
+
+                Text {
+                    text: "\{root.progress-current} / \{root.progress-total}";
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-xs;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+    }
+}
